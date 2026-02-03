@@ -130,7 +130,7 @@ BLOB_ID=$(jq -r '.blobId' <<<"$FINAL")
 
 echo -e "${GREEN}✓ Upload successful${NC}"
 echo -e "${YELLOW}Blob ID:${NC} $BLOB_ID"
-echo -e "${YELLOW}URL:${NC} https://aggregator.walrus.space/v1/blobs/$BLOB_ID"
+echo -e "${YELLOW}URL:${NC} https://aggregator.walrus-testnet.walrus.space/v1/blobs/$BLOB_ID"
 
 rm -rf "$TMP_DIR"
 
