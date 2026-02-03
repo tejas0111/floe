@@ -105,7 +105,7 @@ export async function finalizeUpload(session: InternalSession) {
           epochs: session.resolvedEpochs,
           streamFactory: () => createReadStream(outPath),
         });
-        blobId = result.blobId;
+        blobId = result!.blobId;
         break;
       } catch (err) {
         if (attempt === WALRUS_MAX_RETRIES) throw err;

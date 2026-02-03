@@ -1,5 +1,5 @@
 {
-  "name": "Floe",
+  "name": "@floe/api",
   "private": true,
   "engines": {
     "node": ">=20.0.0"
