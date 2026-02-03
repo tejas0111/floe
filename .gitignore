@@ -1,0 +1,15 @@
+# build artifacts
+node_modules/
+apps/**/node_modules/
+dist/
+
+# temp uploads
+apps/api/tmp/
+apps/api/tmp/**
+
+# env
+.env
+
+# logs
+*.log
+

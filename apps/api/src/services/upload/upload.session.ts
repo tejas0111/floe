@@ -1,0 +1,167 @@
+// src/services/upload/upload.session.ts
+
+import fs from "fs";
+import path from "path";
+
+import { UploadConfig } from "../../config/uploads.config.js";
+import { UploadSession } from "../../types/upload.js";
+import { getRedis } from "../../state/client.js";
+import { uploadKeys } from "../../state/keys.js";
+
+/* =========================
+   Types
+========================= */
+
+export type InternalSession = UploadSession;
+
+/* =========================
+   Helpers
+========================= */
+
+function ensureFsFolder(uploadId: string) {
+  const dir = path.join(UploadConfig.tmpDir, uploadId);
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch (err: any) {
+    if (err.code !== "EEXIST") {
+      throw err;
+    }
+  }
+}
+
+/* =========================
+   Create Session
+========================= */
+
+export async function createSession(input: {
+  uploadId: string;
+  filename: string;
+  contentType: string;
+  sizeBytes: number;
+  chunkSize: number;
+  totalChunks: number;
+  epochs: number;
+}): Promise<InternalSession> {
+  const redis = getRedis();
+  const now = Date.now();
+
+  const {
+    uploadId,
+    filename,
+    contentType,
+    sizeBytes,
+    chunkSize,
+    totalChunks,
+    epochs,
+  } = input;
+
+  if (!uploadId) throw new Error("UPLOAD_ID_REQUIRED");
+  if (!Number.isInteger(epochs) || epochs <= 0) {
+    throw new Error("INVALID_EPOCHS");
+  }
+
+  const expiresAt = now + UploadConfig.sessionTtlMs;
+  const sessionTtlSeconds = Math.floor(
+    UploadConfig.sessionTtlMs / 1000
+  );
+
+  const metaTtlSeconds = Math.floor(
+    (UploadConfig.sessionTtlMs + 30 * 60 * 1000) / 1000
+  );
+
+  const tx = redis.multi()
+    .hset(uploadKeys.session(uploadId), {
+      uploadId,
+      filename,
+      contentType,
+      sizeBytes: String(sizeBytes),
+      chunkSize: String(chunkSize),
+      totalChunks: String(totalChunks),
+      epochs: String(epochs),
+      status: "uploading",
+      createdAt: String(now),
+      expiresAt: String(expiresAt),
+    })
+    .expire(uploadKeys.session(uploadId), sessionTtlSeconds)
+
+    .hset(uploadKeys.meta(uploadId), {
+      status: "uploading",
+      createdAt: String(now),
+      expiresAt: String(expiresAt),
+    })
+    .expire(uploadKeys.meta(uploadId), metaTtlSeconds)
+
+    .sadd(uploadKeys.gcIndex(), uploadId);
+
+  const results = await tx.exec();
+  if (!results) {
+    throw new Error("REDIS_TRANSACTION_FAILED");
+  }
+
+  ensureFsFolder(uploadId);
+
+  return {
+    uploadId,
+    filename,
+    contentType,
+    sizeBytes,
+    chunkSize,
+    totalChunks,
+    receivedChunks: [],
+    resolvedEpochs: epochs,
+    status: "uploading",
+    createdAt: now,
+    expiresAt,
+  };
+}
+
+/* =========================
+   Get Session
+========================= */
+
+export async function getSession(
+  uploadId: string
+): Promise<InternalSession | null> {
+  const redis = getRedis();
+
+  const data = await redis.hgetall<Record<string, string>>(
+    uploadKeys.session(uploadId)
+  );
+
+  if (!data || Object.keys(data).length === 0) {
+    return null;
+  }
+
+  const sizeBytes = Number(data.sizeBytes);
+  const chunkSize = Number(data.chunkSize);
+  const totalChunks = Number(data.totalChunks);
+  const epochs = Number(data.epochs);
+  const createdAt = Number(data.createdAt);
+  const expiresAt = Number(data.expiresAt);
+
+  if (
+    !Number.isFinite(sizeBytes) ||
+    !Number.isFinite(chunkSize) ||
+    !Number.isInteger(totalChunks) ||
+    !Number.isInteger(epochs) ||
+    !Number.isFinite(createdAt) ||
+    !Number.isFinite(expiresAt)
+  ) {
+    throw new Error("CORRUPT_UPLOAD_SESSION");
+  }
+
+  return {
+    uploadId,
+    filename: data.filename,
+    contentType: data.contentType,
+    sizeBytes,
+    chunkSize,
+    totalChunks,
+    receivedChunks: [],
+    resolvedEpochs: epochs,
+    status: data.status as any,
+    createdAt,
+    expiresAt,
+  };
+}
+

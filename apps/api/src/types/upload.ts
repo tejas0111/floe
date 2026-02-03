@@ -1,0 +1,30 @@
+// src/types/upload.ts
+
+export type UploadStatus =
+  | "uploading"
+  | "finalizing"
+  | "completed"
+  | "failed";
+
+export interface UploadSession {
+  uploadId: string;
+  filename: string;
+  contentType: string;
+  sizeBytes: number;
+  chunkSize: number;
+  totalChunks: number;
+  receivedChunks: number[];
+  resolvedEpochs: number;
+  status: UploadStatus;
+  createdAt: number;
+  expiresAt: number;
+}
+
+export interface CompleteUploadResult {
+  videoId: string;
+  blobId: string;
+  epochs: number;
+  sizeBytes: number;
+  status: "ready";
+}
+
