@@ -5,6 +5,7 @@ import multipart from "@fastify/multipart";
 
 import uploadRoutes from "./routes/uploads.routes.js";
 import healthRoute from "./routes/health.js";
+import { filesRoutes } from "./routes/files.routes.js";
 import { initRedis } from "./state/client.js";
 import { startUploadGc, stopUploadGc } from "./state/gc/upload.gc.scheduler.js";
 import { reconcileOrphanUploads } from "./state/gc/upload.gc.reconcile.js";
@@ -50,6 +51,7 @@ await reconcileOrphanUploads(app.log);
 startUploadGc(app.log);
 
 await app.register(uploadRoutes);
+await app.register(filesRoutes);
 await app.register(healthRoute);
 
 app.setErrorHandler((err, req, reply) => {

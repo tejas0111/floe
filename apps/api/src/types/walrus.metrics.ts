@@ -17,7 +17,6 @@ export interface WalrusUploadMetric {
   attempt: number;
   durationMs: number;
   outcome: WalrusUploadOutcome;
-  blobId?: string;
   error?: string;
   network: "mainnet" | "testnet";
   timestamp: number;

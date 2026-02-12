@@ -21,9 +21,7 @@ export interface UploadSession {
 }
 
 export interface CompleteUploadResult {
-  videoId: string;
-  blobId: string;
-  epochs: number;
+  fileId: string;
   sizeBytes: number;
   status: "ready";
 }

@@ -20,10 +20,6 @@ import { uploadKeys } from "../state/keys.js";
 
 export default async function uploadRoutes(app: FastifyInstance) {
 
-  /* =========================
-     CREATE UPLOAD SESSION
-  ========================= */
-
   app.post("/v1/uploads/create", async (req, reply) => {
     const log = req.log;
     const body = req.body as any;
@@ -85,10 +81,6 @@ export default async function uploadRoutes(app: FastifyInstance) {
     }
   });
 
-  /* =========================
-     UPLOAD CHUNK
-  ========================= */
-
   app.put("/v1/uploads/:uploadId/chunk/:index", async (req, reply) => {
     const log = req.log;
     const { uploadId, index } = req.params as any;
@@ -139,9 +131,9 @@ export default async function uploadRoutes(app: FastifyInstance) {
       await chunkStore.writeChunk(
         uploadId,
         idx,
-        part.file,       // Readable stream
-        expectedHash,    // sha256 hex
-        expectedSize,    // bytes
+        part.file,
+        expectedHash,
+        expectedSize,
         isLastChunk
       );
 
@@ -160,10 +152,6 @@ export default async function uploadRoutes(app: FastifyInstance) {
       );
     }
   });
-
-  /* =========================
-     UPLOAD STATUS
-  ========================= */
 
   app.get("/v1/uploads/:uploadId/status", async (req, reply) => {
     const { uploadId } = req.params as { uploadId: string };
@@ -186,13 +174,9 @@ export default async function uploadRoutes(app: FastifyInstance) {
     };
   });
 
-  /* =========================
-     FINALIZE UPLOAD
-  ========================= */
-
   app.post("/v1/uploads/:uploadId/complete", async (req, reply) => {
     const log = req.log;
-    const { uploadId } = req.params as any;
+    const { uploadId } = req.params as { uploadId: string };
 
     const session = await getSession(uploadId);
     if (!session) {
@@ -200,7 +184,12 @@ export default async function uploadRoutes(app: FastifyInstance) {
     }
 
     if (session.status === "completed") {
-      return sendApiError(reply, 409, "UPLOAD_ALREADY_COMPLETED", "Upload is already finalized");
+      return sendApiError(
+        reply,
+        409,
+        "UPLOAD_ALREADY_COMPLETED",
+        "Upload is already finalized"
+      );
     }
 
     const redis = getRedis();
@@ -219,16 +208,20 @@ export default async function uploadRoutes(app: FastifyInstance) {
     try {
       const result = await finalizeUpload(session);
 
-      await redis.hset(uploadKeys.meta(uploadId), {
-        status: "completed",
-        blobId: result.blobId,
-      });
+      log.info(
+        {
+          uploadId,
+          fileId: result.fileId,
+          blobId: result.blobId,
+        },
+        "Upload finalized"
+      );
 
-      log.info({ uploadId, blobId: result.blobId }, "Upload finalized");
+      return reply.code(200).send(result);
 
-      return result;
     } catch (err: any) {
       log.error({ uploadId, err }, "Upload finalization failed");
+
       return sendApiError(
         reply,
         502,
@@ -239,5 +232,3 @@ export default async function uploadRoutes(app: FastifyInstance) {
     }
   });
 }
-
-

@@ -1,6 +1,5 @@
 // src/services/upload/upload.finalize.ts
 
-import crypto from "crypto";
 import fs from "fs/promises";
 import { createWriteStream, createReadStream } from "fs";
 import { once } from "events";
@@ -11,6 +10,7 @@ import { getRedis } from "../../state/client.js";
 import { uploadKeys } from "../../state/keys.js";
 import { chunkStore } from "../../store/index.js";
 import { uploadToWalrusWithMetrics } from "./walrus.metrics.js";
+import { finalizeFileMetadata } from "../../sui/file.metadata.js";
 
 const WALRUS_MAX_RETRIES = 3;
 const WALRUS_RETRY_DELAY_MS = 2000;
@@ -24,22 +24,14 @@ export async function finalizeUpload(session: InternalSession) {
   const redis = getRedis();
   const uploadId = session.uploadId;
   const metaKey = uploadKeys.meta(uploadId);
-
   const existing = await redis.hgetall(metaKey);
   if (existing?.status === "completed") {
-    if (
-      !existing.blobId ||
-      !existing.videoId ||
-      !existing.sizeBytes ||
-      !existing.epochs
-    ) {
+    if (!existing.fileId || !existing.blobId) {
       throw new Error("CORRUPT_COMPLETED_UPLOAD");
     }
 
     return {
-      videoId: existing.videoId,
-      blobId: existing.blobId,
-      epochs: Number(existing.epochs),
+      fileId: existing.fileId,
       sizeBytes: Number(existing.sizeBytes),
       status: "ready" as const,
     };
@@ -50,7 +42,10 @@ export async function finalizeUpload(session: InternalSession) {
     nx: true,
     px: 15 * 60 * 1000,
   });
-  if (!locked) throw new Error("UPLOAD_FINALIZATION_IN_PROGRESS");
+
+  if (!locked) {
+    throw new Error("UPLOAD_FINALIZATION_IN_PROGRESS");
+  }
 
   try {
     await redis.hset(metaKey, {
@@ -58,9 +53,7 @@ export async function finalizeUpload(session: InternalSession) {
       finalizingAt: String(Date.now()),
     });
 
-    const redisCount = await redis.scard(
-      uploadKeys.chunks(uploadId)
-    );
+    const redisCount = await redis.scard(uploadKeys.chunks(uploadId));
     if (redisCount !== session.totalChunks) {
       throw new Error("INCOMPLETE_CHUNKS");
     }
@@ -68,22 +61,16 @@ export async function finalizeUpload(session: InternalSession) {
     const chunks = await chunkStore.listChunks(uploadId);
     const set = new Set(chunks);
     for (let i = 0; i < session.totalChunks; i++) {
-      if (!set.has(i)) throw new Error("MISSING_CHUNKS");
+      if (!set.has(i)) {
+        throw new Error("MISSING_CHUNKS");
+      }
     }
 
     const outPath = finalFilePath(uploadId);
     const ws = createWriteStream(outPath, { flags: "w" });
 
-    ws.on("error", err => {
-      throw err;
-    });
-
     for (let i = 0; i < session.totalChunks; i++) {
       const rs = chunkStore.openChunk(uploadId, i);
-      rs.on("error", err => {
-        throw err;
-      });
-
       for await (const buf of rs) {
         if (!ws.write(buf)) {
           await once(ws, "drain");
@@ -93,7 +80,6 @@ export async function finalizeUpload(session: InternalSession) {
 
     ws.end();
     await once(ws, "finish");
-    await redis.pexpire(lockKey, 15 * 60 * 1000);
 
     let blobId: string | null = null;
 
@@ -102,7 +88,7 @@ export async function finalizeUpload(session: InternalSession) {
         const result = await uploadToWalrusWithMetrics({
           uploadId,
           sizeBytes: session.sizeBytes,
-          epochs: session.resolvedEpochs,
+          epochs: session.resolvedEpochs, // internal only
           streamFactory: () => createReadStream(outPath),
         });
         blobId = result!.blobId;
@@ -113,19 +99,26 @@ export async function finalizeUpload(session: InternalSession) {
       }
     }
 
-    if (!blobId) throw new Error("WALRUS_UPLOAD_FAILED");
+    if (!blobId) {
+      throw new Error("WALRUS_UPLOAD_FAILED");
+    }
+
+    const { fileId } = await finalizeFileMetadata({
+      blobId,
+      sizeBytes: session.sizeBytes,
+      mimeType: session.contentType ?? "application/octet-stream",
+      owner: session.owner, // optional
+    });
 
     await chunkStore.cleanup(uploadId);
     await fs.unlink(outPath).catch(() => {});
 
-    const videoId = crypto.randomUUID();
-
-    const tx = await redis.multi()
+    const tx = await redis
+      .multi()
       .hset(metaKey, {
         status: "completed",
+        fileId,
         blobId,
-        videoId,
-        epochs: String(session.resolvedEpochs),
         sizeBytes: String(session.sizeBytes),
         completedAt: String(Date.now()),
       })
@@ -139,9 +132,7 @@ export async function finalizeUpload(session: InternalSession) {
     }
 
     return {
-      videoId,
-      blobId,
-      epochs: session.resolvedEpochs,
+      fileId,
       sizeBytes: session.sizeBytes,
       status: "ready" as const,
     };
@@ -158,4 +149,3 @@ export async function finalizeUpload(session: InternalSession) {
     await redis.del(lockKey);
   }
 }
-

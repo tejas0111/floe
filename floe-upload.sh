@@ -51,9 +51,15 @@ done
 
 FILE_SIZE=$(stat -c%s "$FILE_TO_UPLOAD" 2>/dev/null || stat -f%z "$FILE_TO_UPLOAD")
 CONTENT_TYPE=$(file --mime-type -b "$FILE_TO_UPLOAD" 2>/dev/null || echo "application/octet-stream")
+TMP_DIR="$(mktemp -d -t floe-upload-XXXXXX)"
+
+cleanup() {
+  rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT
 
 echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║              FLOE V1 UPLOADER                 ║${NC}"
+echo -e "${CYAN}║              FLOE V1 UPLOADER              ║${NC}"
 echo -e "${CYAN}╚════════════════════════════════════════════╝${NC}"
 echo ""
 echo -e "${YELLOW}File:${NC} $(basename "$FILE_TO_UPLOAD")"
@@ -61,6 +67,10 @@ echo -e "${YELLOW}Size:${NC} $(numfmt --to=iec-i "$FILE_SIZE")"
 echo -e "${YELLOW}Type:${NC} $CONTENT_TYPE"
 echo -e "${YELLOW}Epochs:${NC} $EPOCHS"
 echo -e "${YELLOW}Parallel:${NC} $PARALLEL_JOBS"
+
+###############################################################################
+# CREATE UPLOAD SESSION
+###############################################################################
 
 echo -e "\n${BLUE}▶ Creating upload session...${NC}"
 
@@ -75,7 +85,10 @@ JSON=$(cat <<EOF
 EOF
 )
 
-RESP=$(curl -fsS -X POST "$API_BASE/create" -H "Content-Type: application/json" -d "$JSON")
+RESP=$(curl -fsS -X POST "$API_BASE/create" \
+  -H "Content-Type: application/json" \
+  -d "$JSON")
+
 UPLOAD_ID=$(jq -r '.uploadId' <<<"$RESP")
 CHUNK_SIZE=$(jq -r '.chunkSize' <<<"$RESP")
 TOTAL_CHUNKS=$(jq -r '.totalChunks' <<<"$RESP")
@@ -83,12 +96,18 @@ TOTAL_CHUNKS=$(jq -r '.totalChunks' <<<"$RESP")
 [[ -z "$UPLOAD_ID" || "$UPLOAD_ID" == "null" ]] && echo "Session creation failed" && exit 1
 echo -e "${GREEN}✓ Upload ID: $UPLOAD_ID${NC}"
 
-TMP_DIR="./floe_tmp_$UPLOAD_ID"
-mkdir -p "$TMP_DIR"
+###############################################################################
+# SPLIT FILE
+###############################################################################
+
 split -b "$CHUNK_SIZE" -d -a 4 "$FILE_TO_UPLOAD" "$TMP_DIR/chunk-"
 CHUNKS=("$TMP_DIR"/chunk-*)
 
 [[ "${#CHUNKS[@]}" -ne "$TOTAL_CHUNKS" ]] && echo "Chunk count mismatch" && exit 1
+
+###############################################################################
+# UPLOAD CHUNKS
+###############################################################################
 
 upload_chunk() {
   local idx="$1"
@@ -107,7 +126,7 @@ upload_chunk() {
     sleep $attempt
   done
 
-  echo -e "  ${RED}✗${NC} Chunk $idx failed after retries"
+  echo -e "  ${RED}✗${NC} Chunk $idx failed"
   return 1
 }
 
@@ -122,15 +141,25 @@ wait || FAIL=1
 
 [[ $FAIL -ne 0 ]] && echo "Upload failed" && exit 1
 
+###############################################################################
+# FINALIZE
+###############################################################################
+
 echo -e "\n${BLUE}▶ Finalizing upload...${NC}"
 FINAL=$(curl -fsS -X POST "$API_BASE/$UPLOAD_ID/complete")
-BLOB_ID=$(jq -r '.blobId' <<<"$FINAL")
 
-[[ -z "$BLOB_ID" || "$BLOB_ID" == "null" ]] && echo "Finalization failed" && exit 1
+FILE_ID=$(jq -r '.fileId' <<<"$FINAL")
+
+if [[ -z "$FILE_ID" || "$FILE_ID" == "null" ]]; then
+  echo -e "${RED}✗${NC} Finalization failed"
+  echo "$FINAL"
+  exit 1
+fi
+
+###############################################################################
+# SUCCESS
+###############################################################################
 
 echo -e "${GREEN}✓ Upload successful${NC}"
-echo -e "${YELLOW}Blob ID:${NC} $BLOB_ID"
-echo -e "${YELLOW}URL:${NC} https://aggregator.walrus-testnet.walrus.space/v1/blobs/$BLOB_ID"
-
-rm -rf "$TMP_DIR"
-
+echo -e "${YELLOW}File ID:${NC} $FILE_ID"
+echo -e "${YELLOW}Metadata:${NC} http://localhost:3001/v1/files/$FILE_ID/metadata"
