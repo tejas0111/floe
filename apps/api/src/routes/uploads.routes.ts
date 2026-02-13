@@ -339,6 +339,8 @@ export default async function uploadRoutes(app: FastifyInstance) {
   });
 
   // Cancel an in-progress upload session. Best-effort cleanup; GC will catch any leftovers.
+  // This endpoint is intentionally idempotent: repeated cancels return 200 when the upload
+  // is already canceled/expired/failed.
   app.delete("/v1/uploads/:uploadId", async (req, reply) => {
     const log = req.log;
     const { uploadId } = req.params as { uploadId: string };
@@ -347,15 +349,15 @@ export default async function uploadRoutes(app: FastifyInstance) {
       return sendApiError(reply, 400, "INVALID_UPLOAD_ID", "uploadId must be a UUID");
     }
 
-    const session = await getSession(uploadId);
-    if (!session) {
-      return sendApiError(reply, 404, "UPLOAD_NOT_FOUND", "Invalid uploadId");
-    }
-
     const redis = getRedis();
     const metaKey = uploadKeys.meta(uploadId);
     const lockKey = `${metaKey}:lock`;
-    const hasLock = await redis.exists(lockKey);
+
+    const [session, meta, hasLock] = await Promise.all([
+      getSession(uploadId),
+      redis.hgetall<Record<string, string>>(metaKey),
+      redis.exists(lockKey),
+    ]);
 
     if (hasLock) {
       return sendApiError(
@@ -363,6 +365,58 @@ export default async function uploadRoutes(app: FastifyInstance) {
         409,
         "UPLOAD_FINALIZATION_IN_PROGRESS",
         "Upload is currently finalizing"
+      );
+    }
+
+    const status = meta?.status;
+
+    // If the session is already gone, treat delete as idempotent whenever we have
+    // a meta record to explain what happened.
+    if (!session) {
+      if (!status) {
+        return sendApiError(reply, 404, "UPLOAD_NOT_FOUND", "Invalid uploadId");
+      }
+
+      if (status === "completed") {
+        return sendApiError(
+          reply,
+          409,
+          "UPLOAD_ALREADY_COMPLETED",
+          "Upload is already finalized"
+        );
+      }
+
+      if (status === "canceled" || status === "failed" || status === "expired") {
+        return reply.code(200).send({ ok: true, uploadId, status });
+      }
+
+      // Unknown/legacy state: attempt to cancel + cleanup best-effort.
+      await redis.hset(metaKey, {
+        status: "canceled",
+        canceledAt: String(Date.now()),
+      });
+
+      await Promise.all([
+        chunkStore.cleanup(uploadId).catch(() => {}),
+        fs.rm(finalBinPath(uploadId), { force: true }).catch(() => {}),
+      ]);
+
+      await redis
+        .multi()
+        .del(uploadKeys.session(uploadId))
+        .del(uploadKeys.chunks(uploadId))
+        .exec();
+
+      log.info({ uploadId }, "Upload canceled");
+      return reply.code(200).send({ ok: true, uploadId, status: "canceled" });
+    }
+
+    if (status === "completed" || session.status === "completed") {
+      return sendApiError(
+        reply,
+        409,
+        "UPLOAD_ALREADY_COMPLETED",
+        "Upload is already finalized"
       );
     }
 
@@ -386,4 +440,5 @@ export default async function uploadRoutes(app: FastifyInstance) {
     log.info({ uploadId }, "Upload canceled");
     return reply.code(200).send({ ok: true, uploadId, status: "canceled" });
   });
+
 }
