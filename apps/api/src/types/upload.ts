@@ -22,7 +22,7 @@ export interface UploadSession {
 
 export interface CompleteUploadResult {
   fileId: string;
+  blobId: string;
   sizeBytes: number;
   status: "ready";
 }
-
