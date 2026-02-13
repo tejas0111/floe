@@ -10,9 +10,18 @@ export type ApiErrorCode =
   | "INVALID_REQUEST_BODY"
   | "INVALID_CREATE_UPLOAD_REQUEST"
   | "INVALID_FILE_SIZE"
+  | "FILE_TOO_LARGE"
+  | "INVALID_FILENAME"
+  | "INVALID_CONTENT_TYPE"
+  | "INVALID_CHUNK_SIZE"
+  | "INVALID_TOTAL_CHUNKS"
+  | "TOO_MANY_CHUNKS"
+  | "UPLOAD_CAPACITY_REACHED"
+  | "INVALID_UPLOAD_ID"
   | "UPLOAD_NOT_FOUND"
   | "UPLOAD_ALREADY_COMPLETED"
   | "UPLOAD_INCOMPLETE"
+  | "UPLOAD_FINALIZATION_IN_PROGRESS"
   | "INVALID_CHUNK"
   | "CHUNK_STREAM_ERROR"
   | "CHUNK_UPLOAD_FAILED"
@@ -42,9 +51,7 @@ export function sendApiError(
   }
 ) {
   const safeStatus =
-    Number.isInteger(statusCode) &&
-    statusCode >= 400 &&
-    statusCode <= 599
+    Number.isInteger(statusCode) && statusCode >= 400 && statusCode <= 599
       ? statusCode
       : 500;
 
@@ -59,4 +66,3 @@ export function sendApiError(
 
   return reply.code(safeStatus).send(response);
 }
-
