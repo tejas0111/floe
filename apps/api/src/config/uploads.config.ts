@@ -9,18 +9,20 @@ export const UploadConfig = {
   tmpDir: path.resolve(process.env.UPLOAD_TMP_DIR),
 
   maxFileSizeBytes: 15 * 1024 * 1024 * 1024, // 15 GB
+  // Defensive cap to avoid Redis/Disk blowups from absurd client requests.
+  // Example: tiny chunk sizes + huge file sizes -> massive chunk counts.
+  maxTotalChunks: 200_000,
   maxActiveUploads: 100,
   sessionTtlMs: 6 * 60 * 60 * 1000, // 6 hours
 };
 
 export const ChunkConfig = {
-  minBytes: 256 * 1024,          // 256 KB
-  maxBytes: 20 * 1024 * 1024,    // 20 MB
+  minBytes: 256 * 1024, // 256 KB
+  maxBytes: 20 * 1024 * 1024, // 20 MB
   defaultBytes: 2 * 1024 * 1024, // 2 MB
 };
 
 export const GcConfig = {
-  gcInterval: 5 * 60 * 1000,  // 5 minutes
-  grace: 15 * 60 * 1000,      // 15 minutes
+  gcInterval: 5 * 60 * 1000, // 5 minutes
+  grace: 15 * 60 * 1000, // 15 minutes
 };
-
