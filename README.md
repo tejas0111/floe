@@ -90,7 +90,7 @@ This layout reflects current responsibilities and may evolve as streaming and SD
 ## Running it locally
 
 **Requirements:**
-- Node.js 18+
+- Node.js 20+
 - Redis
 - Access to a Walrus node
 
@@ -107,10 +107,41 @@ npm run build && npm run start
 
 **Upload a file:**
 ```bash
-./floe-upload.sh "path to video.mp4" --chunk 2 --epochs 3 --parallel 3
+# Default API base is http://localhost:3001/v1/uploads
+# If your API runs on a different port, use --api or set FLOE_API_BASE.
+./floe-upload.sh "path/to/video.mp4" --chunk 2 --epochs 3 --parallel 3
 ```
 
-The CLI splits your file into 2MB chunks, uploads them in parallel, then triggers finalization. You'll get a Walrus blob ID back.
+The CLI:
+- creates an upload session
+- splits the file into server-approved chunk sizes (max 20MB per chunk)
+- uploads chunks in parallel (unordered)
+- finalizes into a Walrus blob
+- mints an on-chain `fileId` (permanent object ID)
+
+On success it prints the `fileId` and a metadata URL:
+- `GET /v1/files/<fileId>/metadata`
+
+**Resume an upload:**
+
+If the upload is interrupted, you can resume without re-uploading completed chunks.
+
+```bash
+# Auto-resume if a state file exists: <file>.floe-upload.json
+./floe-upload.sh "path/to/video.mp4" --parallel 3
+
+# Or explicitly resume by uploadId
+./floe-upload.sh "path/to/video.mp4" --resume <uploadId> --parallel 3
+```
+
+**CLI settings:**
+- `--api <url>` overrides the API base (example: `http://localhost:3000/v1/uploads`)
+- `FLOE_API_BASE` can be used instead of `--api`
+- Curl tuning:
+  - `FLOE_CURL_CONNECT_TIMEOUT_S` (default: 5)
+  - `FLOE_CURL_MAX_TIME_S` (default: 240)
+  - `FLOE_CURL_RETRY` (default: 3)
+  - `FLOE_CURL_RETRY_DELAY_S` (default: 1)
 
 ---
 
@@ -201,6 +232,14 @@ Think of Walrus as the storage engine and Floe as the ingestion pipeline.
 The core upload pipeline is solid. Tested with real video files, network interruptions, process crashes, and continuous operation.
 
 What's production-ready:
+
+Default v1 limits (to prevent accidental DoS when exposed):
+- max chunk size: 20MB
+- max file size: 15GB
+- max total chunks per upload: 200,000
+- max active uploads admitted: 100
+
+
 - Upload correctness and resumability
 - Unordered chunk handling
 - State persistence via Redis
