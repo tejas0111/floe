@@ -13,3 +13,4 @@ apps/api/tmp/**
 # logs
 *.log
 
+**/floe-move/build/
