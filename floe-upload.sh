@@ -143,13 +143,37 @@ maybe_load_state() {
 
   if [[ -f "$STATE_FILE" ]]; then
     local saved
+    local file_id
+    local completed_at
+
     saved=$(jq -r '.uploadId // empty' "$STATE_FILE" 2>/dev/null || true)
+    file_id=$(jq -r '.fileId // empty' "$STATE_FILE" 2>/dev/null || true)
+    completed_at=$(jq -r '.completedAt // empty' "$STATE_FILE" 2>/dev/null || true)
+
+    # If the state file indicates a completed upload, don't auto-resume.
+    if [[ -n "$file_id" || -n "$completed_at" ]]; then
+      return
+    fi
+
     if [[ -n "$saved" && "$saved" != "null" ]]; then
       RESUME_UPLOAD_ID="$saved"
       echo -e "${YELLOW}Resuming from state file:${NC} $STATE_FILE"
       echo -e "${YELLOW}Upload ID:${NC} $RESUME_UPLOAD_ID"
     fi
   fi
+}
+
+archive_state() {
+  local reason="$1"
+  if [[ ! -f "$STATE_FILE" ]]; then
+    return
+  fi
+  local ts
+  ts=$(date +%s)
+  local dst="${STATE_FILE}.stale.${ts}"
+  mv "$STATE_FILE" "$dst" 2>/dev/null || return
+  echo -e "${YELLOW}State archived:${NC} $dst"
+  echo -e "${YELLOW}Reason:${NC} $reason"
 }
 
 save_state() {
@@ -200,28 +224,50 @@ STATUS_JSON=""
 # CREATE OR RESUME SESSION
 ###############################################################################
 
+RESUMING=0
+
 if [[ -n "$RESUME_UPLOAD_ID" ]]; then
   echo -e "\n${BLUE}▶ Fetching upload status (resume)...${NC}"
 
-  STATUS_JSON=$(curl_json GET "$API_BASE/$RESUME_UPLOAD_ID/status" || true)
-  if [[ -z "$STATUS_JSON" ]]; then
-    echo -e "${RED}✗${NC} Failed to fetch status for $RESUME_UPLOAD_ID" >&2
-    exit 1
+  STATUS_FILE="$TMP_DIR/status.resp.json"
+  HTTP=$(curl -sS \
+    --connect-timeout "$CURL_CONNECT_TIMEOUT_S" \
+    --max-time "$CURL_MAX_TIME_S" \
+    --retry "$CURL_RETRY" \
+    --retry-delay "$CURL_RETRY_DELAY_S" \
+    -o "$STATUS_FILE" \
+    -w "%{http_code}" \
+    -X GET "$API_BASE/$RESUME_UPLOAD_ID/status" || true)
+
+  if [[ "$HTTP" =~ ^2 ]]; then
+    STATUS_JSON=$(cat "$STATUS_FILE")
+
+    UPLOAD_ID="$RESUME_UPLOAD_ID"
+    CHUNK_SIZE=$(jq -r '.chunkSize' <<<"$STATUS_JSON")
+    TOTAL_CHUNKS=$(jq -r '.totalChunks' <<<"$STATUS_JSON")
+
+    if [[ -z "$CHUNK_SIZE" || "$CHUNK_SIZE" == "null" || -z "$TOTAL_CHUNKS" || "$TOTAL_CHUNKS" == "null" ]]; then
+      echo -e "${RED}✗${NC} Invalid status response:" >&2
+      echo "$STATUS_JSON" >&2
+      exit 1
+    fi
+
+    echo -e "${GREEN}✓${NC} Resuming upload: $UPLOAD_ID"
+    RESUMING=1
+  else
+    if [[ "$HTTP" == "404" ]]; then
+      archive_state "uploadId not found (canceled/expired)"
+    else
+      archive_state "failed to fetch status (HTTP ${HTTP})"
+      print_api_error "$STATUS_FILE" "$HTTP" || true
+    fi
+
+    RESUME_UPLOAD_ID=""
+    STATUS_JSON=""
   fi
+fi
 
-  UPLOAD_ID="$RESUME_UPLOAD_ID"
-  CHUNK_SIZE=$(jq -r '.chunkSize' <<<"$STATUS_JSON")
-  TOTAL_CHUNKS=$(jq -r '.totalChunks' <<<"$STATUS_JSON")
-
-  if [[ -z "$CHUNK_SIZE" || "$CHUNK_SIZE" == "null" || -z "$TOTAL_CHUNKS" || "$TOTAL_CHUNKS" == "null" ]]; then
-    echo -e "${RED}✗${NC} Invalid status response:" >&2
-    echo "$STATUS_JSON" >&2
-    exit 1
-  fi
-
-  echo -e "${GREEN}✓${NC} Resuming upload: $UPLOAD_ID"
-
-else
+if [[ "$RESUMING" -ne 1 ]]; then
   echo -e "\n${BLUE}▶ Creating upload session...${NC}"
 
   CHUNK_BYTES_JSON=""
