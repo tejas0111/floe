@@ -2,36 +2,74 @@
 
 import { FastifyInstance } from "fastify";
 import crypto from "crypto";
+import fs from "fs/promises";
+import path from "path";
 
 import { sendApiError } from "../utils/apiError.js";
-import { ChunkConfig } from "../config/uploads.config.js";
+import { ChunkConfig, UploadConfig } from "../config/uploads.config.js";
 import { WalrusEpochLimits } from "../config/walrus.config.js";
 
-import {
-  createSession,
-  getSession,
-} from "../services/upload/upload.session.js";
-
+import { createSession, getSession } from "../services/upload/upload.session.js";
 import { finalizeUpload } from "../services/upload/upload.finalize.js";
 
 import { chunkStore } from "../store/index.js";
 import { getRedis } from "../state/client.js";
 import { uploadKeys } from "../state/keys.js";
 
-export default async function uploadRoutes(app: FastifyInstance) {
+function isUuid(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      value
+    )
+  );
+}
 
+function finalBinPath(uploadId: string) {
+  return path.join(UploadConfig.tmpDir, `${uploadId}.bin`);
+}
+
+export default async function uploadRoutes(app: FastifyInstance) {
   app.post("/v1/uploads/create", async (req, reply) => {
     const log = req.log;
     const body = req.body as any;
 
     if (!body || typeof body !== "object") {
-      return sendApiError(reply, 400, "INVALID_REQUEST_BODY", "Request body must be JSON");
+      return sendApiError(
+        reply,
+        400,
+        "INVALID_REQUEST_BODY",
+        "Request body must be JSON"
+      );
     }
 
     const { filename, contentType, sizeBytes, chunkSize, epochs } = body;
 
     if (!filename || !contentType || !sizeBytes) {
-      return sendApiError(reply, 400, "INVALID_CREATE_UPLOAD_REQUEST", "Missing required fields");
+      return sendApiError(
+        reply,
+        400,
+        "INVALID_CREATE_UPLOAD_REQUEST",
+        "Missing required fields"
+      );
+    }
+
+    if (typeof filename !== "string" || filename.length > 512) {
+      return sendApiError(
+        reply,
+        400,
+        "INVALID_FILENAME",
+        "filename must be <= 512 chars"
+      );
+    }
+
+    if (typeof contentType !== "string" || contentType.length > 128) {
+      return sendApiError(
+        reply,
+        400,
+        "INVALID_CONTENT_TYPE",
+        "contentType must be <= 128 chars"
+      );
     }
 
     const fileSizeNum = Number(sizeBytes);
@@ -39,19 +77,70 @@ export default async function uploadRoutes(app: FastifyInstance) {
       return sendApiError(reply, 400, "INVALID_FILE_SIZE", "sizeBytes must be positive");
     }
 
-    const uploadId = crypto.randomUUID();
+    if (fileSizeNum > UploadConfig.maxFileSizeBytes) {
+      return sendApiError(
+        reply,
+        413,
+        "FILE_TOO_LARGE",
+        `File exceeds maxFileSizeBytes (${UploadConfig.maxFileSizeBytes})`
+      );
+    }
+
+    let chunkSizeNum: number | undefined;
+    if (chunkSize !== undefined) {
+      chunkSizeNum = Number(chunkSize);
+      if (!Number.isFinite(chunkSizeNum) || chunkSizeNum <= 0) {
+        return sendApiError(
+          reply,
+          400,
+          "INVALID_CHUNK_SIZE",
+          "chunkSize must be a positive number"
+        );
+      }
+    }
+
+    let epochsNum: number | undefined;
+    if (epochs !== undefined) {
+      epochsNum = Number(epochs);
+      if (!Number.isFinite(epochsNum) || epochsNum <= 0) {
+        return sendApiError(reply, 400, "INVALID_EPOCHS", "epochs must be a positive number");
+      }
+    }
 
     const resolvedChunkSize = Math.min(
       ChunkConfig.maxBytes,
-      Math.max(ChunkConfig.minBytes, chunkSize ?? ChunkConfig.defaultBytes)
+      Math.max(ChunkConfig.minBytes, chunkSizeNum ?? ChunkConfig.defaultBytes)
     );
 
     const resolvedEpochs = Math.min(
       WalrusEpochLimits.max,
-      Math.max(WalrusEpochLimits.min, epochs ?? WalrusEpochLimits.default)
+      Math.max(WalrusEpochLimits.min, epochsNum ?? WalrusEpochLimits.default)
     );
 
     const totalChunks = Math.ceil(fileSizeNum / resolvedChunkSize);
+
+    if (!Number.isFinite(totalChunks) || totalChunks <= 0) {
+      return sendApiError(reply, 400, "INVALID_TOTAL_CHUNKS", "Invalid totalChunks derived from inputs");
+    }
+
+    if (totalChunks > UploadConfig.maxTotalChunks) {
+      return sendApiError(
+        reply,
+        413,
+        "TOO_MANY_CHUNKS",
+        `totalChunks exceeds maxTotalChunks (${UploadConfig.maxTotalChunks})`
+      );
+    }
+
+    const redis = getRedis();
+    const activeUploads = await redis.scard(uploadKeys.gcIndex());
+    if (activeUploads >= UploadConfig.maxActiveUploads) {
+      return sendApiError(reply, 429, "UPLOAD_CAPACITY_REACHED", "Too many active uploads", {
+        retryable: true,
+      });
+    }
+
+    const uploadId = crypto.randomUUID();
 
     try {
       const session = await createSession({
@@ -75,15 +164,25 @@ export default async function uploadRoutes(app: FastifyInstance) {
       });
     } catch (err) {
       log.error({ err }, "Session creation failed");
-      return sendApiError(reply, 500, "SESSION_CREATE_FAILED", "Failed to create upload session", {
-        retryable: true,
-      });
+      return sendApiError(
+        reply,
+        500,
+        "SESSION_CREATE_FAILED",
+        "Failed to create upload session",
+        {
+          retryable: true,
+        }
+      );
     }
   });
 
   app.put("/v1/uploads/:uploadId/chunk/:index", async (req, reply) => {
     const log = req.log;
     const { uploadId, index } = req.params as any;
+
+    if (!isUuid(uploadId)) {
+      return sendApiError(reply, 400, "INVALID_UPLOAD_ID", "uploadId must be a UUID");
+    }
 
     const session = await getSession(uploadId);
     if (!session) {
@@ -156,6 +255,10 @@ export default async function uploadRoutes(app: FastifyInstance) {
   app.get("/v1/uploads/:uploadId/status", async (req, reply) => {
     const { uploadId } = req.params as { uploadId: string };
 
+    if (!isUuid(uploadId)) {
+      return sendApiError(reply, 400, "INVALID_UPLOAD_ID", "uploadId must be a UUID");
+    }
+
     const session = await getSession(uploadId);
     if (!session) {
       return sendApiError(reply, 404, "UPLOAD_NOT_FOUND", "Invalid uploadId");
@@ -177,6 +280,10 @@ export default async function uploadRoutes(app: FastifyInstance) {
   app.post("/v1/uploads/:uploadId/complete", async (req, reply) => {
     const log = req.log;
     const { uploadId } = req.params as { uploadId: string };
+
+    if (!isUuid(uploadId)) {
+      return sendApiError(reply, 400, "INVALID_UPLOAD_ID", "uploadId must be a UUID");
+    }
 
     const session = await getSession(uploadId);
     if (!session) {
@@ -218,7 +325,6 @@ export default async function uploadRoutes(app: FastifyInstance) {
       );
 
       return reply.code(200).send(result);
-
     } catch (err: any) {
       log.error({ uploadId, err }, "Upload finalization failed");
 
@@ -230,5 +336,54 @@ export default async function uploadRoutes(app: FastifyInstance) {
         { retryable: true }
       );
     }
+  });
+
+  // Cancel an in-progress upload session. Best-effort cleanup; GC will catch any leftovers.
+  app.delete("/v1/uploads/:uploadId", async (req, reply) => {
+    const log = req.log;
+    const { uploadId } = req.params as { uploadId: string };
+
+    if (!isUuid(uploadId)) {
+      return sendApiError(reply, 400, "INVALID_UPLOAD_ID", "uploadId must be a UUID");
+    }
+
+    const session = await getSession(uploadId);
+    if (!session) {
+      return sendApiError(reply, 404, "UPLOAD_NOT_FOUND", "Invalid uploadId");
+    }
+
+    const redis = getRedis();
+    const metaKey = uploadKeys.meta(uploadId);
+    const lockKey = `${metaKey}:lock`;
+    const hasLock = await redis.exists(lockKey);
+
+    if (hasLock) {
+      return sendApiError(
+        reply,
+        409,
+        "UPLOAD_FINALIZATION_IN_PROGRESS",
+        "Upload is currently finalizing"
+      );
+    }
+
+    await redis.hset(metaKey, {
+      status: "canceled",
+      canceledAt: String(Date.now()),
+    });
+
+    await Promise.all([
+      chunkStore.cleanup(uploadId).catch(() => {}),
+      fs.rm(finalBinPath(uploadId), { force: true }).catch(() => {}),
+    ]);
+
+    // Preserve meta for inspection, but remove active session/chunk state.
+    await redis
+      .multi()
+      .del(uploadKeys.session(uploadId))
+      .del(uploadKeys.chunks(uploadId))
+      .exec();
+
+    log.info({ uploadId }, "Upload canceled");
+    return reply.code(200).send({ ok: true, uploadId, status: "canceled" });
   });
 }
