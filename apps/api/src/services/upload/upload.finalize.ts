@@ -1,6 +1,7 @@
 // src/services/upload/upload.finalize.ts
 
 import fs from "fs/promises";
+import path from "path";
 import { createWriteStream, createReadStream } from "fs";
 import { once } from "events";
 
@@ -15,25 +16,33 @@ import { finalizeFileMetadata } from "../../sui/file.metadata.js";
 const WALRUS_MAX_RETRIES = 3;
 const WALRUS_RETRY_DELAY_MS = 2000;
 
-const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const finalFilePath = (uploadId: string) =>
-  `${UploadConfig.tmpDir}/${uploadId}.bin`;
+  path.join(UploadConfig.tmpDir, `${uploadId}.bin`);
 
-export async function finalizeUpload(session: InternalSession) {
+export async function finalizeUpload(session: InternalSession): Promise<{
+  fileId: string;
+  blobId: string;
+  sizeBytes: number;
+  status: "ready";
+}> {
   const redis = getRedis();
   const uploadId = session.uploadId;
   const metaKey = uploadKeys.meta(uploadId);
-  const existing = await redis.hgetall(metaKey);
-  if (existing?.status === "completed") {
-    if (!existing.fileId || !existing.blobId) {
+
+  // Fast-path idempotency.
+  const pre = await redis.hgetall<Record<string, string>>(metaKey);
+  if (pre?.status === "completed") {
+    if (!pre.fileId || !pre.blobId) {
       throw new Error("CORRUPT_COMPLETED_UPLOAD");
     }
 
     return {
-      fileId: existing.fileId,
-      sizeBytes: Number(existing.sizeBytes),
-      status: "ready" as const,
+      fileId: pre.fileId,
+      blobId: pre.blobId,
+      sizeBytes: Number(pre.sizeBytes ?? session.sizeBytes),
+      status: "ready",
     };
   }
 
@@ -48,6 +57,21 @@ export async function finalizeUpload(session: InternalSession) {
   }
 
   try {
+    // Re-check inside the lock (race-safe).
+    const meta = await redis.hgetall<Record<string, string>>(metaKey);
+    if (meta?.status === "completed") {
+      if (!meta.fileId || !meta.blobId) {
+        throw new Error("CORRUPT_COMPLETED_UPLOAD");
+      }
+
+      return {
+        fileId: meta.fileId,
+        blobId: meta.blobId,
+        sizeBytes: Number(meta.sizeBytes ?? session.sizeBytes),
+        status: "ready",
+      };
+    }
+
     await redis.hset(metaKey, {
       status: "finalizing",
       finalizingAt: String(Date.now()),
@@ -67,48 +91,71 @@ export async function finalizeUpload(session: InternalSession) {
     }
 
     const outPath = finalFilePath(uploadId);
-    const ws = createWriteStream(outPath, { flags: "w" });
 
-    for (let i = 0; i < session.totalChunks; i++) {
-      const rs = chunkStore.openChunk(uploadId, i);
-      for await (const buf of rs) {
-        if (!ws.write(buf)) {
-          await once(ws, "drain");
+    // Checkpointed fields (best-effort).
+    let blobId: string | null = meta?.blobId ?? null;
+    let fileId: string | null = meta?.fileId ?? null;
+
+    // Only assemble/upload if we don't already have a durable blobId checkpoint.
+    if (!blobId) {
+      const ws = createWriteStream(outPath, { flags: "w" });
+
+      for (let i = 0; i < session.totalChunks; i++) {
+        const rs = chunkStore.openChunk(uploadId, i);
+        for await (const buf of rs) {
+          if (!ws.write(buf)) {
+            await once(ws, "drain");
+          }
         }
       }
-    }
 
-    ws.end();
-    await once(ws, "finish");
+      ws.end();
+      await once(ws, "finish");
 
-    let blobId: string | null = null;
+      for (let attempt = 1; attempt <= WALRUS_MAX_RETRIES; attempt++) {
+        try {
+          const result = await uploadToWalrusWithMetrics({
+            uploadId,
+            sizeBytes: session.sizeBytes,
+            epochs: session.resolvedEpochs,
+            streamFactory: () => createReadStream(outPath),
+          });
 
-    for (let attempt = 1; attempt <= WALRUS_MAX_RETRIES; attempt++) {
-      try {
-        const result = await uploadToWalrusWithMetrics({
-          uploadId,
-          sizeBytes: session.sizeBytes,
-          epochs: session.resolvedEpochs, // internal only
-          streamFactory: () => createReadStream(outPath),
-        });
-        blobId = result!.blobId;
-        break;
-      } catch (err) {
-        if (attempt === WALRUS_MAX_RETRIES) throw err;
-        await sleep(WALRUS_RETRY_DELAY_MS * attempt);
+          blobId = result!.blobId;
+          break;
+        } catch (err) {
+          if (attempt === WALRUS_MAX_RETRIES) throw err;
+          await sleep(WALRUS_RETRY_DELAY_MS * attempt);
+        }
       }
+
+      if (!blobId) {
+        throw new Error("WALRUS_UPLOAD_FAILED");
+      }
+
+      // Checkpoint immediately so retries don't re-upload and re-pay.
+      await redis.hset(metaKey, {
+        blobId,
+        walrusUploadedAt: String(Date.now()),
+      });
     }
 
-    if (!blobId) {
-      throw new Error("WALRUS_UPLOAD_FAILED");
-    }
+    if (!fileId) {
+      const minted = await finalizeFileMetadata({
+        blobId,
+        sizeBytes: session.sizeBytes,
+        mimeType: session.contentType ?? "application/octet-stream",
+        owner: undefined,
+      });
 
-    const { fileId } = await finalizeFileMetadata({
-      blobId,
-      sizeBytes: session.sizeBytes,
-      mimeType: session.contentType ?? "application/octet-stream",
-      owner: session.owner, // optional
-    });
+      fileId = minted.fileId;
+
+      // Checkpoint early to reduce duplicate mint risk on retry.
+      await redis.hset(metaKey, {
+        fileId,
+        metadataFinalizedAt: String(Date.now()),
+      });
+    }
 
     await chunkStore.cleanup(uploadId);
     await fs.unlink(outPath).catch(() => {});
@@ -133,18 +180,18 @@ export async function finalizeUpload(session: InternalSession) {
 
     return {
       fileId,
+      blobId,
       sizeBytes: session.sizeBytes,
-      status: "ready" as const,
+      status: "ready",
     };
-
   } catch (err) {
     await redis.hset(metaKey, {
       status: "failed",
       error: (err as Error).message,
       failedAt: String(Date.now()),
     });
-    throw err;
 
+    throw err;
   } finally {
     await redis.del(lockKey);
   }
