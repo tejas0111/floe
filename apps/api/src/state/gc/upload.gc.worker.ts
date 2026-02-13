@@ -24,6 +24,7 @@ const GRACE_MS = GcConfig.grace;
 const GC_ELIGIBLE_STATUSES = new Set([
   "failed",
   "expired",
+  "canceled",
 ]);
 
 export async function runUploadGc(log: FastifyBaseLogger) {
