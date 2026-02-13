@@ -9,6 +9,7 @@ import { filesRoutes } from "./routes/files.routes.js";
 import { initRedis } from "./state/client.js";
 import { startUploadGc, stopUploadGc } from "./state/gc/upload.gc.scheduler.js";
 import { reconcileOrphanUploads } from "./state/gc/upload.gc.reconcile.js";
+import { ChunkConfig } from "./config/uploads.config.js";
 
 process.on("unhandledRejection", (reason) => {
   console.error("❌ Unhandled promise rejection:", reason);
@@ -27,14 +28,16 @@ const app = Fastify({
       remove: true,
     },
   },
-  bodyLimit: 10 * 1024 * 1024 * 1024, // 10 GB
+  // Requests should be chunk-sized (multipart) or small JSON.
+  bodyLimit: ChunkConfig.maxBytes + 1024 * 1024,
 });
 
 await app.register(multipart, {
   attachFieldsToBody: false,
   throwFileSizeLimit: false,
   limits: {
-    fileSize: 10 * 1024 * 1024 * 1024,
+    // One chunk per request.
+    fileSize: ChunkConfig.maxBytes,
     files: 1,
   },
 });
@@ -69,9 +72,9 @@ app.setErrorHandler((err, req, reply) => {
     error: {
       code: statusCode < 500 ? "REQUEST_ERROR" : "INTERNAL_ERROR",
       message:
-  statusCode < 500 && err instanceof Error
-    ? err.message
-    : "Unexpected server error",
+        statusCode < 500 && err instanceof Error
+          ? err.message
+          : "Unexpected server error",
 
       retryable: false,
     },
@@ -110,4 +113,3 @@ async function shutdown(signal: string) {
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
-
