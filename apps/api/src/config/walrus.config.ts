@@ -13,6 +13,11 @@ export const WalrusEnv = {
   aggregatorUrl: process.env.WALRUS_AGGREGATOR_URL,
 };
 
+export const WalrusReadLimits = {
+  timeoutMs: Number(process.env.WALRUS_READ_TIMEOUT_MS ?? 60_000),
+  maxRangeBytes: Number(process.env.FLOE_STREAM_MAX_RANGE_BYTES ?? 16 * 1024 * 1024),
+};
+
 export const WalrusEpochLimits = {
   min: 1,
   max: 90,

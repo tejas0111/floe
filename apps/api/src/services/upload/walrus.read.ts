@@ -1,8 +1,6 @@
 // src/services/upload/walrus.read.ts
 
-import { WalrusEnv } from "../../config/walrus.config.js";
-
-const FETCH_TIMEOUT_MS = 60_000;
+import { WalrusEnv, WalrusReadLimits } from "../../config/walrus.config.js";
 
 function normalizeBaseUrl(url: string): string {
   return url.replace(/\/$/, "");
@@ -20,7 +18,7 @@ export async function fetchWalrusBlob(params: {
   if (params.rangeHeader) headers["Range"] = params.rangeHeader;
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), WalrusReadLimits.timeoutMs);
 
   const onAbort = () => controller.abort();
   if (params.signal) {

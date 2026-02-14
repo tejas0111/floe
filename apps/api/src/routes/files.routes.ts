@@ -4,6 +4,7 @@ import { FastifyInstance } from "fastify";
 import { suiClient } from "../sui/client.js";
 import { Readable } from "node:stream";
 import { fetchWalrusBlob } from "../services/upload/walrus.read.js";
+import { WalrusReadLimits } from "../config/walrus.config.js";
 
 function inferContainerFromMime(mimeType: string): string | null {
   const m = (mimeType ?? "").toLowerCase();
@@ -56,6 +57,15 @@ function parseSingleRangeHeader(
   if (start >= sizeBytes) return null;
 
   return { start, end: Math.min(end, sizeBytes - 1) };
+}
+
+function applyMaxRangeWindow(
+  range: { start: number; end: number },
+  maxBytes: number
+): { start: number; end: number } {
+  const span = range.end - range.start + 1;
+  if (span <= maxBytes) return range;
+  return { start: range.start, end: range.start + maxBytes - 1 };
 }
 
 async function getFileFields(fileId: string) {
@@ -173,8 +183,13 @@ export async function filesRoutes(app: FastifyInstance) {
           .send({ error: "INVALID_RANGE", message: "Unsupported Range header" });
       }
 
+      let effective = parsed;
+      if (effective && Number.isFinite(WalrusReadLimits.maxRangeBytes) && WalrusReadLimits.maxRangeBytes > 0) {
+        effective = applyMaxRangeWindow(effective, WalrusReadLimits.maxRangeBytes);
+      }
+
       const upstreamRange =
-        parsed ? `bytes=${parsed.start}-${parsed.end}` : undefined;
+        effective ? `bytes=${effective.start}-${effective.end}` : undefined;
 
       const abortController = new AbortController();
       const abortUpstream = () => abortController.abort();
@@ -188,9 +203,19 @@ export async function filesRoutes(app: FastifyInstance) {
         signal: abortController.signal,
       });
 
+      if (!upstream.ok && upstream.status !== 206) {
+        const text = await upstream.text().catch(() => "");
+        reply.type("application/json");
+        return reply.status(upstream.status).send({
+          error: "WALRUS_READ_FAILED",
+          status: upstream.status,
+          message: text || "Failed to read from Walrus aggregator",
+        });
+      }
+
       // Strict HTTP Range semantics: if the client asked for a range and the upstream
       // didn't return 206, don't fall back to a full-body response.
-      if (parsed && upstream.status !== 206) {
+      if (effective && upstream.status !== 206) {
         const text = await upstream.text().catch(() => "");
         reply.type("application/json");
         return reply.status(502).send({
@@ -211,16 +236,6 @@ export async function filesRoutes(app: FastifyInstance) {
       for (const h of copyHeaders) {
         const v = upstream.headers.get(h);
         if (v) reply.header(h, v);
-      }
-
-      if (!upstream.ok && upstream.status !== 206) {
-        const text = await upstream.text().catch(() => "");
-        reply.type("application/json");
-        return reply.status(upstream.status).send({
-          error: "WALRUS_READ_FAILED",
-          status: upstream.status,
-          message: text || "Failed to read from Walrus aggregator",
-        });
       }
 
       // For successful reads, serve the asset's declared content type.
