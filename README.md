@@ -147,7 +147,8 @@ If the upload is interrupted, you can resume without re-uploading completed chun
 
 ## API reference
 
-These endpoints expose the upload control plane only; they do not serve video playback.
+Floe v1 exposes an ingestion control plane and a stable asset model. It does not
+serve video playback yet (streaming/read endpoints are a planned next step).
 
 Simple REST endpoints:
 
@@ -157,9 +158,14 @@ PUT    /v1/uploads/:id/chunk/:n     # Upload chunk n
 GET    /v1/uploads/:id/status       # Check upload progress
 POST   /v1/uploads/:id/complete     # Finalize to Walrus
 DELETE /v1/uploads/:id              # Cancel upload
+
+GET    /v1/files/:fileId/metadata   # Asset metadata (stable fields)
+GET    /v1/files/:fileId/manifest   # Asset layout manifest (read-path contract)
 ```
 
 Each chunk upload includes an `x-chunk-sha256` header for integrity verification.
+By default, Floe does not expose the underlying Walrus `blobId` in file
+responses. To include it for debugging, pass `?includeBlobId=1`.
 
 ---
 
