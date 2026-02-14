@@ -11,6 +11,9 @@ EPOCHS=1
 PARALLEL_JOBS=1
 RESUME_UPLOAD_ID=""
 MAX_RETRIES=3
+KEEP_STATE=0
+STATE_DIR_OVERRIDE=""
+STATE_FILE_OVERRIDE=""
 
 # API
 API_BASE="${FLOE_API_BASE:-http://localhost:3001/v1/uploads}"
@@ -39,6 +42,9 @@ show_help() {
   echo "  -p, --parallel <n>    Parallel uploads (default: 1)"
   echo "      --resume <id>     Resume an existing uploadId (skips already uploaded chunks)"
   echo "      --api <url>       Override API base (default: ${API_BASE})"
+  echo "      --state <path>    Override state file path (disables auto state naming)"
+  echo "      --state-dir <dir> Store state files under this directory"
+  echo "      --keep-state      Keep the state file after a successful upload"
   echo "  -h, --help            Show help"
   exit 0
 }
@@ -55,6 +61,9 @@ while [[ $# -gt 0 ]]; do
     -p|--parallel) PARALLEL_JOBS="$2"; shift ;;
     --resume) RESUME_UPLOAD_ID="$2"; shift ;;
     --api) API_BASE="$2"; shift ;;
+    --state) STATE_FILE_OVERRIDE="$2"; shift ;;
+    --state-dir) STATE_DIR_OVERRIDE="$2"; shift ;;
+    --keep-state) KEEP_STATE=1 ;;
     -h|--help) show_help ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
@@ -86,7 +95,43 @@ fi
 FILE_SIZE=$(stat -c%s "$FILE_TO_UPLOAD" 2>/dev/null || stat -f%z "$FILE_TO_UPLOAD")
 CONTENT_TYPE=$(file --mime-type -b "$FILE_TO_UPLOAD" 2>/dev/null || echo "application/octet-stream")
 TMP_DIR="$(mktemp -d -t floe-upload-XXXXXX)"
-STATE_FILE="${FILE_TO_UPLOAD}.floe-upload.json"
+
+resolve_abs_path() {
+  local p="$1"
+  if command -v realpath >/dev/null 2>&1; then
+    realpath "$p"
+    return
+  fi
+  if command -v readlink >/dev/null 2>&1; then
+    readlink -f "$p" 2>/dev/null || echo "$p"
+    return
+  fi
+  echo "$p"
+}
+
+default_state_dir() {
+  if [[ -n "${FLOE_STATE_DIR:-}" ]]; then
+    echo "$FLOE_STATE_DIR"
+    return
+  fi
+  if [[ -n "${XDG_STATE_HOME:-}" ]]; then
+    echo "${XDG_STATE_HOME%/}/floe"
+    return
+  fi
+  echo "${HOME%/}/.local/state/floe"
+}
+
+STATE_DIR="$(default_state_dir)"
+if [[ -n "$STATE_DIR_OVERRIDE" ]]; then
+  STATE_DIR="$STATE_DIR_OVERRIDE"
+fi
+
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+
+ABS_FILE_PATH="$(resolve_abs_path "$FILE_TO_UPLOAD")"
+STATE_KEY="$(printf '%s' "${ABS_FILE_PATH}|${FILE_SIZE}|${CONTENT_TYPE}" | sha256sum | awk '{print $1}')"
+DEFAULT_STATE_FILE="${STATE_DIR%/}/$(basename "$FILE_TO_UPLOAD").${STATE_KEY}.floe-upload.json"
+STATE_FILE="${STATE_FILE_OVERRIDE:-$DEFAULT_STATE_FILE}"
 
 cleanup() {
   rm -rf "$TMP_DIR"
@@ -181,11 +226,14 @@ save_state() {
   local chunk_size="$2"
   local total_chunks="$3"
 
+  mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null || true
+
   cat > "$STATE_FILE" <<JSON
 {
   "uploadId": "${upload_id}",
   "apiBase": "${API_BASE}",
   "file": "${FILE_TO_UPLOAD}",
+  "fileAbs": "${ABS_FILE_PATH}",
   "fileSize": ${FILE_SIZE},
   "contentType": "${CONTENT_TYPE}",
   "chunkSize": ${chunk_size},
@@ -427,11 +475,15 @@ echo -e "${YELLOW}File ID:${NC} $FILE_ID"
 FILES_BASE="${API_BASE%/v1/uploads}"
 echo -e "${YELLOW}Metadata:${NC} ${FILES_BASE}/v1/files/$FILE_ID/metadata"
 
-# Mark state as completed (best-effort).
+# Mark state as completed (best-effort), then remove unless keep-state is enabled.
 if [[ -f "$STATE_FILE" ]]; then
   tmp_state="$TMP_DIR/state.completed.json"
   jq --arg fileId "$FILE_ID" '. + {"fileId": $fileId, "completedAt": (now|floor)}' "$STATE_FILE" > "$tmp_state" 2>/dev/null || true
   if [[ -s "$tmp_state" ]]; then
     mv "$tmp_state" "$STATE_FILE" || true
+  fi
+
+  if [[ "$KEEP_STATE" -eq 0 && "${FLOE_KEEP_STATE:-0}" != "1" ]]; then
+    rm -f "$STATE_FILE" 2>/dev/null || true
   fi
 fi
