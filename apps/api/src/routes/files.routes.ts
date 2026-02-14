@@ -59,15 +59,6 @@ function parseSingleRangeHeader(
   return { start, end: Math.min(end, sizeBytes - 1) };
 }
 
-function applyMaxRangeWindow(
-  range: { start: number; end: number },
-  maxBytes: number
-): { start: number; end: number } {
-  const span = range.end - range.start + 1;
-  if (span <= maxBytes) return range;
-  return { start: range.start, end: range.start + maxBytes - 1 };
-}
-
 async function getFileFields(fileId: string) {
   const obj = await suiClient.getObject({
     id: fileId,
@@ -183,13 +174,24 @@ export async function filesRoutes(app: FastifyInstance) {
           .send({ error: "INVALID_RANGE", message: "Unsupported Range header" });
       }
 
-      let effective = parsed;
-      if (effective && Number.isFinite(WalrusReadLimits.maxRangeBytes) && WalrusReadLimits.maxRangeBytes > 0) {
-        effective = applyMaxRangeWindow(effective, WalrusReadLimits.maxRangeBytes);
+      if (
+        parsed &&
+        Number.isFinite(WalrusReadLimits.maxRangeBytes) &&
+        WalrusReadLimits.maxRangeBytes > 0
+      ) {
+        const span = parsed.end - parsed.start + 1;
+        if (span > WalrusReadLimits.maxRangeBytes) {
+          reply.type("application/json");
+          return reply.status(416).send({
+            error: "RANGE_TOO_LARGE",
+            message: `Range exceeds maxRangeBytes (${WalrusReadLimits.maxRangeBytes})`,
+            maxRangeBytes: WalrusReadLimits.maxRangeBytes,
+          });
+        }
       }
 
       const upstreamRange =
-        effective ? `bytes=${effective.start}-${effective.end}` : undefined;
+        parsed ? `bytes=${parsed.start}-${parsed.end}` : undefined;
 
       const abortController = new AbortController();
       const abortUpstream = () => abortController.abort();
@@ -215,7 +217,7 @@ export async function filesRoutes(app: FastifyInstance) {
 
       // Strict HTTP Range semantics: if the client asked for a range and the upstream
       // didn't return 206, don't fall back to a full-body response.
-      if (effective && upstream.status !== 206) {
+      if (parsed && upstream.status !== 206) {
         const text = await upstream.text().catch(() => "");
         reply.type("application/json");
         return reply.status(502).send({

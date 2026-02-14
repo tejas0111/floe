@@ -14,8 +14,8 @@ export const WalrusEnv = {
 };
 
 export const WalrusReadLimits = {
-  timeoutMs: Number(process.env.WALRUS_READ_TIMEOUT_MS ?? 60_000),
-  maxRangeBytes: Number(process.env.FLOE_STREAM_MAX_RANGE_BYTES ?? 16 * 1024 * 1024),
+  timeoutMs: Number(process.env.WALRUS_READ_TIMEOUT_MS ?? 10 * 60_000),
+  maxRangeBytes: Number(process.env.FLOE_STREAM_MAX_RANGE_BYTES ?? 64 * 1024 * 1024),
 };
 
 export const WalrusEpochLimits = {
