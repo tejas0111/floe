@@ -10,6 +10,8 @@ import type { Readable } from "stream";
 import { UploadConfig } from "../config/uploads.config.js";
 import type { ChunkStore } from "./chunk.store.js";
 
+const STALE_TMP_MS = 10 * 60 * 1000;
+
 function createValidationStream(
   expectedSize: number,
   hash: crypto.Hash
@@ -54,21 +56,48 @@ export class DiskChunkStore implements ChunkStore {
 
     fs.mkdirSync(dir, { recursive: true });
 
+    // If the final chunk already exists, treat this as idempotent.
+    if (fs.existsSync(finalPath)) {
+      return;
+    }
+
     const hash = crypto.createHash("sha256");
     const validator = createValidationStream(expectedSize, hash);
 
-    let ws: fs.WriteStream;
+    let ws: fs.WriteStream | null = null;
 
-    try {
-      ws = fs.createWriteStream(tempPath, { flags: "wx" });
-    } catch (err: any) {
-      if (err.code === "EEXIST") {
-        return;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        ws = fs.createWriteStream(tempPath, { flags: "wx" });
+        break;
+      } catch (err: any) {
+        if (err.code !== "EEXIST") throw err;
+
+        // Another writer may be in progress, or a previous attempt crashed.
+        if (fs.existsSync(finalPath)) {
+          return;
+        }
+
+        try {
+          const st = fs.statSync(tempPath);
+          const isStale = Date.now() - st.mtimeMs > STALE_TMP_MS;
+          if (isStale && attempt === 0) {
+            fs.rmSync(tempPath, { force: true });
+            continue;
+          }
+        } catch {
+          // If we can't stat it, treat as in-progress to avoid corrupting another writer.
+        }
+
+        throw new Error("CHUNK_IN_PROGRESS");
       }
-      throw err;
     }
 
     try {
+      if (!ws) {
+        throw new Error("CHUNK_TEMP_CREATE_FAILED");
+      }
+
       await pipeline(stream, validator, ws);
 
       const actualHash = hash.digest("hex");
@@ -130,4 +159,3 @@ export class DiskChunkStore implements ChunkStore {
     fs.rmSync(this.dir(uploadId), { recursive: true, force: true });
   }
 }
-

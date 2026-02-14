@@ -181,6 +181,18 @@ export async function filesRoutes(app: FastifyInstance) {
         rangeHeader: upstreamRange,
       });
 
+      // Strict HTTP Range semantics: if the client asked for a range and the upstream
+      // didn't return 206, don't fall back to a full-body response.
+      if (parsed && upstream.status !== 206) {
+        const text = await upstream.text().catch(() => "");
+        reply.type("application/json");
+        return reply.status(502).send({
+          error: "WALRUS_RANGE_UNSUPPORTED",
+          status: upstream.status,
+          message: text || "Upstream did not honor Range request",
+        });
+      }
+
       // Pass through key headers that matter for playback/seek.
       const copyHeaders = [
         "content-length",

@@ -241,6 +241,16 @@ export default async function uploadRoutes(app: FastifyInstance) {
 
       return { ok: true, chunkIndex: idx };
     } catch (err: any) {
+      if (err?.message === "CHUNK_IN_PROGRESS") {
+        log.info({ uploadId, idx }, "Chunk upload already in progress");
+        return sendApiError(
+          reply,
+          409,
+          "CHUNK_IN_PROGRESS",
+          "Chunk upload already in progress, retry shortly",
+          { retryable: true }
+        );
+      }
       log.warn({ uploadId, idx, err }, "Chunk upload failed");
       return sendApiError(
         reply,

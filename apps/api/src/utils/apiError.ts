@@ -29,6 +29,7 @@ export type ApiErrorCode =
   | "UPLOAD_FAILED"
   | "INVALID_EPOCHS"
   | "RATE_LIMITED"
+  | "CHUNK_IN_PROGRESS"
   | "INTERNAL_ERROR";
 
 export interface ApiErrorResponse {
