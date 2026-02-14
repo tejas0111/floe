@@ -176,9 +176,16 @@ export async function filesRoutes(app: FastifyInstance) {
       const upstreamRange =
         parsed ? `bytes=${parsed.start}-${parsed.end}` : undefined;
 
+      const abortController = new AbortController();
+      const abortUpstream = () => abortController.abort();
+      // Best-effort: stop reading from Walrus if the client disconnects.
+      req.raw.once("aborted", abortUpstream);
+      req.raw.once("close", abortUpstream);
+
       const upstream = await fetchWalrusBlob({
         blobId,
         rangeHeader: upstreamRange,
+        signal: abortController.signal,
       });
 
       // Strict HTTP Range semantics: if the client asked for a range and the upstream

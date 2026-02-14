@@ -1,4 +1,4 @@
-// src/routes/health.tss
+// src/routes/health.ts
 
 import { FastifyInstance } from "fastify";
 import { getRedis } from "../state/client.js";
@@ -35,4 +35,3 @@ export default async function healthRoute(app: FastifyInstance) {
     });
   });
 }
-

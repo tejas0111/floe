@@ -10,6 +10,7 @@ import {
 } from "../../types/walrus.metrics.js";
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+type WalrusUploadResult = Awaited<ReturnType<typeof uploadToWalrusOnce>>;
 
 function extractWalrusHttpStatus(err: unknown): number | undefined {
   const msg = String((err as any)?.message ?? "");
@@ -24,12 +25,17 @@ export async function uploadToWalrusWithMetrics(params: {
   sizeBytes: number;
   epochs: number;
   streamFactory: () => Readable;
-}) {
+}): Promise<{
+  blobId: string;
+  objectId?: string;
+  cost?: number;
+  endEpoch?: number;
+}> {
   const start = Date.now();
   let lastError: any;
 
   try {
-    const result = await walrusQueue.add(async () => {
+    const result = (await walrusQueue.add(async () => {
       for (let attempt = 1; attempt <= WalrusUploadLimits.maxRetries; attempt++) {
         try {
           const res = await uploadToWalrusOnce(
@@ -58,7 +64,7 @@ export async function uploadToWalrusWithMetrics(params: {
       }
 
       throw lastError ?? new Error("WALRUS_RETRIES_EXHAUSTED");
-    });
+    })) as WalrusUploadResult;
 
     return result;
 

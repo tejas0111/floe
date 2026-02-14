@@ -13,11 +13,6 @@ import { chunkStore } from "../../store/index.js";
 import { uploadToWalrusWithMetrics } from "./walrus.metrics.js";
 import { finalizeFileMetadata } from "../../sui/file.metadata.js";
 
-const WALRUS_MAX_RETRIES = 3;
-const WALRUS_RETRY_DELAY_MS = 2000;
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
 const finalFilePath = (uploadId: string) =>
   path.join(UploadConfig.tmpDir, `${uploadId}.bin`);
 
@@ -112,22 +107,14 @@ export async function finalizeUpload(session: InternalSession): Promise<{
       ws.end();
       await once(ws, "finish");
 
-      for (let attempt = 1; attempt <= WALRUS_MAX_RETRIES; attempt++) {
-        try {
-          const result = await uploadToWalrusWithMetrics({
-            uploadId,
-            sizeBytes: session.sizeBytes,
-            epochs: session.resolvedEpochs,
-            streamFactory: () => createReadStream(outPath),
-          });
+      const result = await uploadToWalrusWithMetrics({
+        uploadId,
+        sizeBytes: session.sizeBytes,
+        epochs: session.resolvedEpochs,
+        streamFactory: () => createReadStream(outPath),
+      });
 
-          blobId = result!.blobId;
-          break;
-        } catch (err) {
-          if (attempt === WALRUS_MAX_RETRIES) throw err;
-          await sleep(WALRUS_RETRY_DELAY_MS * attempt);
-        }
-      }
+      blobId = result.blobId;
 
       if (!blobId) {
         throw new Error("WALRUS_UPLOAD_FAILED");

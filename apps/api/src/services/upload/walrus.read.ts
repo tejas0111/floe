@@ -11,6 +11,7 @@ function normalizeBaseUrl(url: string): string {
 export async function fetchWalrusBlob(params: {
   blobId: string;
   rangeHeader?: string;
+  signal?: AbortSignal;
 }): Promise<Response> {
   const aggregator = normalizeBaseUrl(WalrusEnv.aggregatorUrl);
   const url = `${aggregator}/v1/blobs/${encodeURIComponent(params.blobId)}`;
@@ -20,6 +21,15 @@ export async function fetchWalrusBlob(params: {
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+  const onAbort = () => controller.abort();
+  if (params.signal) {
+    if (params.signal.aborted) {
+      controller.abort();
+    } else {
+      params.signal.addEventListener("abort", onAbort, { once: true });
+    }
+  }
 
   try {
     const res = await fetch(url, {
@@ -31,5 +41,10 @@ export async function fetchWalrusBlob(params: {
     return res;
   } finally {
     clearTimeout(timeout);
+    if (params.signal) {
+      try {
+        params.signal.removeEventListener("abort", onAbort);
+      } catch {}
+    }
   }
 }

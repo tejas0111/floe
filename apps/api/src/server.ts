@@ -2,6 +2,9 @@
 
 import Fastify from "fastify";
 import multipart from "@fastify/multipart";
+import fs from "fs/promises";
+import os from "os";
+import path from "path";
 
 import uploadRoutes from "./routes/uploads.routes.js";
 import healthRoute from "./routes/health.js";
@@ -9,7 +12,7 @@ import { filesRoutes } from "./routes/files.routes.js";
 import { initRedis } from "./state/client.js";
 import { startUploadGc, stopUploadGc } from "./state/gc/upload.gc.scheduler.js";
 import { reconcileOrphanUploads } from "./state/gc/upload.gc.reconcile.js";
-import { ChunkConfig } from "./config/uploads.config.js";
+import { ChunkConfig, UploadConfig } from "./config/uploads.config.js";
 
 process.on("unhandledRejection", (reason) => {
   console.error("Unhandled promise rejection:", reason);
@@ -42,8 +45,29 @@ await app.register(multipart, {
   },
 });
 
+async function validateUploadTmpDir() {
+  const dir = UploadConfig.tmpDir;
+  const home = os.homedir();
+
+  if (!path.isAbsolute(dir)) {
+    throw new Error("UPLOAD_TMP_DIR must be an absolute path");
+  }
+  if (dir === "/" || dir === "/home" || dir === home) {
+    throw new Error(`UPLOAD_TMP_DIR is unsafe: ${dir}`);
+  }
+
+  await fs.mkdir(dir, { recursive: true });
+
+  // Verify we can write to the directory. This prevents starting with a
+  // misconfigured path that will later fail during uploads/GC/cancel.
+  const probe = path.join(dir, `.floe_write_test_${process.pid}_${Date.now()}`);
+  await fs.writeFile(probe, "ok");
+  await fs.unlink(probe);
+}
+
 try {
   await initRedis();
+  await validateUploadTmpDir();
   app.log.info("Redis initialized");
 } catch (err) {
   app.log.error(err, "Failed to initialize Redis");

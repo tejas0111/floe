@@ -27,6 +27,15 @@ if (
   );
 }
 
+if (
+  FLOE_NETWORK === "mainnet" &&
+  RPC_URL.includes("testnet")
+) {
+  throw new Error(
+    "NETWORK_MISMATCH: mainnet Floe cannot use testnet Sui RPC"
+  );
+}
+
 export const suiClient = new SuiClient({
   url: RPC_URL,
 });
