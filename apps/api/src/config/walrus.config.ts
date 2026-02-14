@@ -4,8 +4,13 @@ if (!process.env.WALRUS_PUBLISHER_URL) {
   throw new Error("Missing required env: WALRUS_PUBLISHER_URL");
 }
 
+if (!process.env.WALRUS_AGGREGATOR_URL) {
+  throw new Error("Missing required env: WALRUS_AGGREGATOR_URL");
+}
+
 export const WalrusEnv = {
   publisherUrl: process.env.WALRUS_PUBLISHER_URL,
+  aggregatorUrl: process.env.WALRUS_AGGREGATOR_URL,
 };
 
 export const WalrusEpochLimits = {
@@ -35,4 +40,3 @@ export const WalrusQueueLimits = {
    */
   intervalMs: 1500,
 };
-

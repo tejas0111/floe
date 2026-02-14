@@ -103,8 +103,9 @@ If the upload is interrupted, you can resume without re-uploading completed chun
 
 ## API reference
 
-Floe v1 exposes an ingestion control plane and a stable asset model. It does not
-serve video playback yet (streaming/read endpoints are a planned next step).
+Floe v1 exposes an ingestion control plane and a stable asset model. It also
+includes a minimal read endpoint (`/stream`) designed for HTTP byte-range reads.
+Treat read-path support as beta: correct semantics first, performance tuning later.
 
 Simple REST endpoints:
 
@@ -117,6 +118,8 @@ DELETE /v1/uploads/:id              # Cancel upload
 
 GET    /v1/files/:fileId/metadata   # Asset metadata (stable fields)
 GET    /v1/files/:fileId/manifest   # Asset layout manifest (read-path contract)
+GET    /v1/files/:fileId/stream     # Read bytes (supports HTTP Range)
+HEAD   /v1/files/:fileId/stream     # Content headers for playback clients
 ```
 
 Each chunk upload includes an `x-chunk-sha256` header for integrity verification.
