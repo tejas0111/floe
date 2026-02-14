@@ -38,7 +38,7 @@ export async function reconcileOrphanUploads(
 
     log.warn(
       { uploadId },
-      "🧹 Recovered orphan upload; registering for GC"
+      "Recovered orphan upload; registering for GC"
     );
 
     await redis.multi()

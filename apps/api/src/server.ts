@@ -12,11 +12,11 @@ import { reconcileOrphanUploads } from "./state/gc/upload.gc.reconcile.js";
 import { ChunkConfig } from "./config/uploads.config.js";
 
 process.on("unhandledRejection", (reason) => {
-  console.error("❌ Unhandled promise rejection:", reason);
+  console.error("Unhandled promise rejection:", reason);
 });
 
 process.on("uncaughtException", (err) => {
-  console.error("❌ Uncaught exception:", err);
+  console.error("Uncaught exception:", err);
   process.exit(1);
 });
 

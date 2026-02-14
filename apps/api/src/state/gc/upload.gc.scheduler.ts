@@ -10,7 +10,7 @@ let running: Promise<void> | null = null;
 export function startUploadGc(log: FastifyBaseLogger) {
   if (timer) return;
 
-  log.info("🧹 Upload GC started");
+  log.info("Upload GC started");
 
   timer = setInterval(async () => {
     if (running) return; // prevent overlap

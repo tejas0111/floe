@@ -387,6 +387,8 @@ export default async function uploadRoutes(app: FastifyInstance) {
       }
 
       if (status === "canceled" || status === "failed" || status === "expired") {
+        // Ensure this upload no longer counts against active capacity.
+        await redis.srem(uploadKeys.gcIndex(), uploadId);
         return reply.code(200).send({ ok: true, uploadId, status });
       }
 
@@ -435,6 +437,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
       .multi()
       .del(uploadKeys.session(uploadId))
       .del(uploadKeys.chunks(uploadId))
+      .srem(uploadKeys.gcIndex(), uploadId)
       .exec();
 
     log.info({ uploadId }, "Upload canceled");

@@ -33,6 +33,17 @@ const WALRUS_PUBLISHER_URL = (() => {
   return url.replace(/\/$/, "");
 })();
 
+if (IS_MAINNET && /testnet/i.test(WALRUS_PUBLISHER_URL)) {
+  console.warn(
+    "WALRUS_PUBLISHER_URL looks like testnet but FLOE_NETWORK=mainnet; verify your env"
+  );
+}
+if (!IS_MAINNET && /mainnet/i.test(WALRUS_PUBLISHER_URL)) {
+  console.warn(
+    "WALRUS_PUBLISHER_URL looks like mainnet but FLOE_NETWORK=testnet; verify your env"
+  );
+}
+
 let cachedKeypair: Ed25519Keypair | null = null;
 let lastBalanceCheck = 0;
 
@@ -54,23 +65,41 @@ function loadWalletKeypair(): Ed25519Keypair {
   }
 
   if (key.startsWith("[")) {
-    const arr = JSON.parse(key);
-    cachedKeypair = Ed25519Keypair.fromSecretKey(
-      Uint8Array.from(arr).slice(0, 32)
-    );
-    return cachedKeypair;
+    try {
+      const arr = JSON.parse(key);
+      cachedKeypair = Ed25519Keypair.fromSecretKey(
+        Uint8Array.from(arr).slice(0, 32)
+      );
+      return cachedKeypair;
+    } catch (err: any) {
+      throw new Error(
+        `Invalid JSON array SUI_PRIVATE_KEY: ${err?.message ?? "parse error"}`
+      );
+    }
   }
 
   if (/^[A-Za-z0-9+/]+=*$/.test(key)) {
-    cachedKeypair = Ed25519Keypair.fromSecretKey(fromB64(key));
-    return cachedKeypair;
+    try {
+      cachedKeypair = Ed25519Keypair.fromSecretKey(fromB64(key));
+      return cachedKeypair;
+    } catch (err: any) {
+      throw new Error(
+        `Invalid base64 SUI_PRIVATE_KEY: ${err?.message ?? "decode error"}`
+      );
+    }
   }
 
   if (/^(0x)?[0-9a-fA-F]+$/.test(key)) {
-    cachedKeypair = Ed25519Keypair.fromSecretKey(
-      fromHEX(key.replace(/^0x/, "")).slice(0, 32)
-    );
-    return cachedKeypair;
+    try {
+      cachedKeypair = Ed25519Keypair.fromSecretKey(
+        fromHEX(key.replace(/^0x/, "")).slice(0, 32)
+      );
+      return cachedKeypair;
+    } catch (err: any) {
+      throw new Error(
+        `Invalid hex SUI_PRIVATE_KEY: ${err?.message ?? "decode error"}`
+      );
+    }
   }
 
   throw new Error("Unrecognized SUI_PRIVATE_KEY format");
@@ -190,4 +219,3 @@ async function safeReadText(res: Response): Promise<string> {
     return "";
   }
 }
-

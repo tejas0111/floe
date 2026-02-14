@@ -8,15 +8,9 @@ import { UploadSession } from "../../types/upload.js";
 import { getRedis } from "../../state/client.js";
 import { uploadKeys } from "../../state/keys.js";
 
-/* =========================
-   Types
-========================= */
 
 export type InternalSession = UploadSession;
 
-/* =========================
-   Helpers
-========================= */
 
 function ensureFsFolder(uploadId: string) {
   const dir = path.join(UploadConfig.tmpDir, uploadId);
@@ -29,9 +23,6 @@ function ensureFsFolder(uploadId: string) {
   }
 }
 
-/* =========================
-   Create Session
-========================= */
 
 export async function createSession(input: {
   uploadId: string;
@@ -115,9 +106,6 @@ export async function createSession(input: {
   };
 }
 
-/* =========================
-   Get Session
-========================= */
 
 export async function getSession(
   uploadId: string

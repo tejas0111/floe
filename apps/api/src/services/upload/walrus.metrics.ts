@@ -11,6 +11,14 @@ import {
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
+function extractWalrusHttpStatus(err: unknown): number | undefined {
+  const msg = String((err as any)?.message ?? "");
+  const m = msg.match(/WALRUS_UPLOAD_FAILED:(\d{3})\b/);
+  if (!m) return undefined;
+  const status = Number(m[1]);
+  return Number.isFinite(status) ? status : undefined;
+}
+
 export async function uploadToWalrusWithMetrics(params: {
   uploadId: string;
   sizeBytes: number;
@@ -61,10 +69,9 @@ export async function uploadToWalrusWithMetrics(params: {
       epochs: params.epochs,
       attempt: WalrusUploadLimits.maxRetries,
       durationMs: Date.now() - start,
-      outcome: err?.name === "AbortError"
-        ? "queue_timeout"
-        : classifyWalrusError(err),
+      outcome: classifyWalrusError(err),
       error: err?.message ?? "unknown",
+      httpStatus: extractWalrusHttpStatus(err),
       network: process.env.FLOE_NETWORK as any,
       timestamp: Date.now(),
     });
@@ -72,4 +79,3 @@ export async function uploadToWalrusWithMetrics(params: {
     throw err;
   }
 }
-

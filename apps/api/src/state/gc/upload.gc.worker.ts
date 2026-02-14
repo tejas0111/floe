@@ -52,7 +52,7 @@ export async function runUploadGc(log: FastifyBaseLogger) {
     let status = meta?.status;
 
     /**
-     * 🔒 HARD SAFETY:
+     * HARD SAFETY:
      * If a finalize lock exists, NEVER TOUCH.
      */
     if (hasLock) {
@@ -60,7 +60,7 @@ export async function runUploadGc(log: FastifyBaseLogger) {
     }
 
     /**
-     * 🔥 CRITICAL FIX:
+     * CRITICAL FIX:
      * Infer expiration when the session is gone but
      * the status never transitioned.
      *
@@ -124,11 +124,11 @@ export async function runUploadGc(log: FastifyBaseLogger) {
 
     log.warn(
       { uploadId, status },
-      "🗑️ GC deleting failed/expired upload artifacts"
+      "GC deleting failed/expired upload artifacts"
     );
 
     /**
-     * 🔥 ALWAYS attempt both deletions.
+     * Always attempt both deletions.
      * Chunk dir may not exist. `.bin` may not exist.
      * That is fine.
      */
