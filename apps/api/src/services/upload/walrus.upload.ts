@@ -23,7 +23,24 @@ const NETWORK = (() => {
 })();
 
 const IS_MAINNET = NETWORK === "mainnet";
-const SUI_RPC_URL = IS_MAINNET ? MAINNET_RPC : TESTNET_RPC;
+const SUI_RPC_URL = (() => {
+  const configured = process.env.SUI_RPC_URL?.trim();
+  const fallback = IS_MAINNET ? MAINNET_RPC : TESTNET_RPC;
+  const url = configured || fallback;
+
+  if (!/^https?:\/\//.test(url)) {
+    throw new Error("SUI_RPC_URL must start with http:// or https://");
+  }
+
+  if (IS_MAINNET && /testnet/i.test(url)) {
+    throw new Error("NETWORK_MISMATCH: mainnet Floe cannot use testnet Sui RPC");
+  }
+  if (!IS_MAINNET && /mainnet/i.test(url)) {
+    throw new Error("NETWORK_MISMATCH: testnet Floe cannot use mainnet Sui RPC");
+  }
+
+  return url;
+})();
 
 const WALRUS_PUBLISHER_URL = (() => {
   const url = WalrusEnv.publisherUrl;
