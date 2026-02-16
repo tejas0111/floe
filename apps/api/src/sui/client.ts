@@ -10,6 +10,17 @@ if (!RPC_URL) {
   throw new Error("SUI_RPC_URL is not set");
 }
 
+if (!/^https?:\/\//.test(RPC_URL)) {
+  throw new Error("SUI_RPC_URL must start with http:// or https://");
+}
+
+// Common misconfig: this hostname often fails to resolve in some environments.
+if (RPC_URL.includes("rpc.testnet.sui.io")) {
+  throw new Error(
+    "SUI_RPC_URL looks invalid/unreachable (rpc.testnet.sui.io). Use a fullnode URL like https://fullnode.testnet.sui.io:443"
+  );
+}
+
 if (!PRIVATE_KEY) {
   throw new Error("SUI_PRIVATE_KEY is not set");
 }
@@ -18,22 +29,12 @@ if (!FLOE_NETWORK) {
   throw new Error("FLOE_NETWORK is not set");
 }
 
-if (
-  FLOE_NETWORK === "testnet" &&
-  RPC_URL.includes("mainnet")
-) {
-  throw new Error(
-    "NETWORK_MISMATCH: testnet Floe cannot use mainnet Sui RPC"
-  );
+if (FLOE_NETWORK === "testnet" && RPC_URL.includes("mainnet")) {
+  throw new Error("NETWORK_MISMATCH: testnet Floe cannot use mainnet Sui RPC");
 }
 
-if (
-  FLOE_NETWORK === "mainnet" &&
-  RPC_URL.includes("testnet")
-) {
-  throw new Error(
-    "NETWORK_MISMATCH: mainnet Floe cannot use testnet Sui RPC"
-  );
+if (FLOE_NETWORK === "mainnet" && RPC_URL.includes("testnet")) {
+  throw new Error("NETWORK_MISMATCH: mainnet Floe cannot use testnet Sui RPC");
 }
 
 export const suiClient = new SuiClient({
