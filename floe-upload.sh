@@ -10,6 +10,7 @@ CUSTOM_CHUNK_SIZE_MB=""
 EPOCHS=1
 PARALLEL_JOBS=1
 RESUME_UPLOAD_ID=""
+EXPLICIT_RESUME=0
 MAX_RETRIES=3
 KEEP_STATE=0
 STATE_DIR_OVERRIDE=""
@@ -59,7 +60,7 @@ while [[ $# -gt 0 ]]; do
     -c|--chunk) CUSTOM_CHUNK_SIZE_MB="$2"; shift ;;
     -e|--epochs) EPOCHS="$2"; shift ;;
     -p|--parallel) PARALLEL_JOBS="$2"; shift ;;
-    --resume) RESUME_UPLOAD_ID="$2"; shift ;;
+    --resume) RESUME_UPLOAD_ID="$2"; EXPLICIT_RESUME=1; shift ;;
     --api) API_BASE="$2"; shift ;;
     --state) STATE_FILE_OVERRIDE="$2"; shift ;;
     --state-dir) STATE_DIR_OVERRIDE="$2"; shift ;;
@@ -310,6 +311,12 @@ if [[ -n "$RESUME_UPLOAD_ID" ]]; then
       print_api_error "$STATUS_FILE" "$HTTP" || true
     fi
 
+    if [[ "$EXPLICIT_RESUME" -eq 1 ]]; then
+      echo -e "${RED}✗${NC} Could not resume uploadId: $RESUME_UPLOAD_ID" >&2
+      echo -e "${YELLOW}Tip:${NC} remove --resume to create a new upload session" >&2
+      exit 1
+    fi
+
     RESUME_UPLOAD_ID=""
     STATUS_JSON=""
   fi
@@ -474,6 +481,8 @@ echo -e "${YELLOW}File ID:${NC} $FILE_ID"
 # Metadata endpoint is fileId-based.
 FILES_BASE="${API_BASE%/v1/uploads}"
 echo -e "${YELLOW}Metadata:${NC} ${FILES_BASE}/v1/files/$FILE_ID/metadata"
+echo -e "${YELLOW}Manifest:${NC} ${FILES_BASE}/v1/files/$FILE_ID/manifest"
+echo -e "${YELLOW}Stream:${NC} ${FILES_BASE}/v1/files/$FILE_ID/stream"
 
 # Mark state as completed (best-effort), then remove unless keep-state is enabled.
 if [[ -f "$STATE_FILE" ]]; then
