@@ -8,7 +8,7 @@ import { once } from "events";
 import { UploadConfig } from "../../config/uploads.config.js";
 import { InternalSession } from "./upload.session.js";
 import { getRedis } from "../../state/client.js";
-import { uploadKeys } from "../../state/keys.js";
+import { uploadKeys, fileKeys } from "../../state/keys.js";
 import { chunkStore } from "../../store/index.js";
 import { uploadToWalrusWithMetrics } from "./walrus.metrics.js";
 import { finalizeFileMetadata } from "../../sui/file.metadata.js";
@@ -136,6 +136,23 @@ export async function finalizeUpload(session: InternalSession): Promise<{
       });
 
       fileId = minted.fileId;
+
+      // Cache fields immediately so streaming does not depend on Sui RPC availability.
+      await redis
+        .set(
+          fileKeys.fields(fileId),
+          JSON.stringify({
+            blob_id: blobId,
+            size_bytes: session.sizeBytes,
+            mime: session.contentType ?? "application/octet-stream",
+            created_at: Date.now(),
+            owner: null,
+          }),
+          {
+            px: Number(process.env.FLOE_FILE_FIELDS_CACHE_TTL_MS ?? 24 * 60 * 60_000),
+          }
+        )
+        .catch(() => {});
 
       // Checkpoint early to reduce duplicate mint risk on retry.
       await redis.hset(metaKey, {
