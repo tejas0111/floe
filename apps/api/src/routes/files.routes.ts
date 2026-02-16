@@ -1,8 +1,11 @@
 // src/routes/files.routes.ts
 
 import { FastifyInstance } from "fastify";
-import { suiClient } from "../sui/client.js";
 import { Readable } from "node:stream";
+
+import { suiClient } from "../sui/client.js";
+import { getRedis } from "../state/client.js";
+import { fileKeys } from "../state/keys.js";
 import { fetchWalrusBlob } from "../services/upload/walrus.read.js";
 import { WalrusReadLimits } from "../config/walrus.config.js";
 
@@ -23,12 +26,19 @@ function shouldExposeBlobId(req: any): boolean {
   return raw === "1" || raw === "true" || raw === true;
 }
 
-function parseSingleRangeHeader(
-  rangeHeader: string,
-  sizeBytes: number
-): { start: number; end: number } | null {
-  const m = rangeHeader.match(/^bytes=(\d*)-(\d*)$/);
-  if (!m) return null;
+type ParsedRange = {
+  start: number;
+  end: number;
+};
+
+function parseSingleRangeHeader(params: {
+  rangeHeader: string;
+  sizeBytes: number;
+}): { range: ParsedRange; kind: "bounded" | "open" | "suffix" } | { error: "INVALID_RANGE" } {
+  const { rangeHeader, sizeBytes } = params;
+
+  const m = rangeHeader.trim().match(/^bytes=(\d*)-(\d*)$/i);
+  if (!m) return { error: "INVALID_RANGE" };
 
   const rawStart = m[1];
   const rawEnd = m[2];
@@ -36,30 +46,56 @@ function parseSingleRangeHeader(
   // Suffix: bytes=-N
   if (rawStart === "" && rawEnd !== "") {
     const suffixLen = Number(rawEnd);
-    if (!Number.isFinite(suffixLen) || suffixLen <= 0) return null;
+    if (!Number.isFinite(suffixLen) || suffixLen <= 0) return { error: "INVALID_RANGE" };
+
     const end = sizeBytes - 1;
     const start = Math.max(0, sizeBytes - suffixLen);
-    return { start, end };
+    return { range: { start, end }, kind: "suffix" };
   }
 
   const start = Number(rawStart);
-  if (!Number.isFinite(start) || start < 0) return null;
+  if (!Number.isFinite(start) || start < 0) return { error: "INVALID_RANGE" };
 
   // Open ended: bytes=N-
   if (rawEnd === "") {
     const end = sizeBytes - 1;
-    if (start > end) return null;
-    return { start, end };
+    if (start > end) return { error: "INVALID_RANGE" };
+    return { range: { start, end }, kind: "open" };
   }
 
-  const end = Number(rawEnd);
-  if (!Number.isFinite(end) || end < start) return null;
-  if (start >= sizeBytes) return null;
+  const endRaw = Number(rawEnd);
+  if (!Number.isFinite(endRaw) || endRaw < start) return { error: "INVALID_RANGE" };
+  if (start >= sizeBytes) return { error: "INVALID_RANGE" };
 
-  return { start, end: Math.min(end, sizeBytes - 1) };
+  const end = Math.min(endRaw, sizeBytes - 1);
+  return { range: { start, end }, kind: "bounded" };
 }
 
-async function getFileFields(fileId: string) {
+const FILE_FIELDS_CACHE_TTL_MS = Number(
+  process.env.FLOE_FILE_FIELDS_CACHE_TTL_MS ?? 24 * 60 * 60_000
+);
+
+function fileFieldsCacheKey(fileId: string) {
+  return fileKeys.fields(fileId);
+}
+
+async function getFileFieldsCached(fileId: string): Promise<any | null> {
+  const redis = getRedis();
+
+  if (Number.isFinite(FILE_FIELDS_CACHE_TTL_MS) && FILE_FIELDS_CACHE_TTL_MS > 0) {
+    const cached = await redis
+      .get<string>(fileFieldsCacheKey(fileId))
+      .catch(() => null);
+
+    if (cached) {
+      try {
+        return JSON.parse(cached);
+      } catch {
+        // Ignore corrupt cache entries.
+      }
+    }
+  }
+
   const obj = await suiClient.getObject({
     id: fileId,
     options: { showContent: true },
@@ -69,14 +105,119 @@ async function getFileFields(fileId: string) {
     return null;
   }
 
-  return obj.data.content.fields as any;
+  const fields = obj.data.content.fields as any;
+
+  if (Number.isFinite(FILE_FIELDS_CACHE_TTL_MS) && FILE_FIELDS_CACHE_TTL_MS > 0) {
+    await redis
+      .set(fileFieldsCacheKey(fileId), JSON.stringify(fields), {
+        px: FILE_FIELDS_CACHE_TTL_MS,
+      })
+      .catch(() => {});
+  }
+
+  return fields;
+}
+
+async function* walrusByteStream(params: {
+  blobId: string;
+  start: number;
+  end: number;
+  maxSegmentBytes: number;
+  signal: AbortSignal;
+}): AsyncGenerator<Uint8Array> {
+  const maxSegmentBytes =
+    Number.isFinite(params.maxSegmentBytes) && params.maxSegmentBytes > 0
+      ? params.maxSegmentBytes
+      : 16 * 1024 * 1024;
+
+  const minSegmentBytes = 256 * 1024; // 256KiB
+
+  let offset = params.start;
+
+  while (offset <= params.end) {
+    if (params.signal.aborted) return;
+
+    // Start optimistic, shrink on 416.
+    let segSize = Math.min(maxSegmentBytes, params.end - offset + 1);
+
+    while (true) {
+      const segEnd = Math.min(params.end, offset + segSize - 1);
+
+      const { res: upstream } = await fetchWalrusBlob({
+        blobId: params.blobId,
+        rangeHeader: `bytes=${offset}-${segEnd}`,
+        signal: params.signal,
+      });
+
+      // Some public aggregators enforce strict/low max range sizes and return 416.
+      // Adapt by shrinking the request until it succeeds.
+      if (upstream.status === 416 && segSize > minSegmentBytes) {
+        segSize = Math.max(minSegmentBytes, Math.floor(segSize / 2));
+        continue;
+      }
+
+      if (upstream.status !== 206) {
+        const text = await upstream.text().catch(() => "");
+        throw new Error(
+          `WALRUS_RANGE_FAILED status=${upstream.status} ${text || ""}`.trim()
+        );
+      }
+
+      const body = upstream.body;
+      if (!body) return;
+
+      const rs = Readable.fromWeb(body as any);
+      const expected = segEnd - offset + 1;
+      let read = 0;
+
+      for await (const chunk of rs) {
+        if (params.signal.aborted) return;
+        const buf = chunk as Uint8Array;
+        read += buf.byteLength;
+        yield buf;
+      }
+
+      if (read < expected) {
+        if (read === 0) {
+          throw new Error(
+            `WALRUS_EMPTY_SEGMENT offset=${offset} end=${segEnd}`
+          );
+        }
+
+        // Upstream cut the connection early. Retry the remaining bytes.
+        // We keep the HTTP response to the client intact; this happens server-side.
+        offset += read;
+        segSize = Math.max(minSegmentBytes, Math.floor(segSize / 2));
+        continue;
+      }
+
+      if (read > expected) {
+        throw new Error(
+          `WALRUS_SEGMENT_OVERRUN expected=${expected} read=${read}`
+        );
+      }
+
+      offset = segEnd + 1;
+      break;
+    }
+  }
 }
 
 export async function filesRoutes(app: FastifyInstance) {
   app.get("/v1/files/:fileId/metadata", async (req, res) => {
     const { fileId } = req.params as { fileId: string };
 
-    const fields = await getFileFields(fileId);
+    let fields: any | null = null;
+    try {
+      fields = await getFileFieldsCached(fileId);
+    } catch (err) {
+      req.log.error({ err, fileId }, "Sui read failed");
+      return res.status(503).send({
+        error: "SUI_UNAVAILABLE",
+        message: "Failed to fetch file metadata from Sui",
+      });
+    }
+
     if (!fields) {
       return res.status(404).send({ error: "FILE_NOT_FOUND" });
     }
@@ -103,7 +244,17 @@ export async function filesRoutes(app: FastifyInstance) {
   app.get("/v1/files/:fileId/manifest", async (req, res) => {
     const { fileId } = req.params as { fileId: string };
 
-    const fields = await getFileFields(fileId);
+    let fields: any | null = null;
+    try {
+      fields = await getFileFieldsCached(fileId);
+    } catch (err) {
+      req.log.error({ err, fileId }, "Sui read failed");
+      return res.status(503).send({
+        error: "SUI_UNAVAILABLE",
+        message: "Failed to fetch file metadata from Sui",
+      });
+    }
+
     if (!fields) {
       return res.status(404).send({ error: "FILE_NOT_FOUND" });
     }
@@ -115,8 +266,6 @@ export async function filesRoutes(app: FastifyInstance) {
     const createdAt = Number(fields.created_at);
     const container = inferContainerFromMime(mimeType);
 
-    // Manifest v1 models each uploaded asset as a single Walrus blob. Future
-    // versions can evolve to multi-blob layouts without breaking the fileId API.
     return {
       manifestVersion: 1,
       fileId,
@@ -143,8 +292,21 @@ export async function filesRoutes(app: FastifyInstance) {
     url: "/v1/files/:fileId/stream",
     handler: async (req, reply) => {
       const { fileId } = req.params as { fileId: string };
-      const fields = await getFileFields(fileId);
+
+      let fields: any | null = null;
+      try {
+        fields = await getFileFieldsCached(fileId);
+      } catch (err) {
+        req.log.error({ err, fileId }, "Sui read failed");
+        reply.type("application/json");
+        return reply.status(503).send({
+          error: "SUI_UNAVAILABLE",
+          message: "Failed to fetch file metadata from Sui",
+        });
+      }
+
       if (!fields) {
+        reply.type("application/json");
         return reply.status(404).send({ error: "FILE_NOT_FOUND" });
       }
 
@@ -153,6 +315,7 @@ export async function filesRoutes(app: FastifyInstance) {
       const mimeType = fields.mime as string;
 
       reply.header("Accept-Ranges", "bytes");
+      reply.header("ETag", blobId);
 
       // HEAD requests can be satisfied from metadata.
       if (req.method === "HEAD") {
@@ -161,91 +324,59 @@ export async function filesRoutes(app: FastifyInstance) {
         return reply.status(200).send();
       }
 
+      // Only single-range is supported.
       const rangeHeader = (req.headers as any)?.range as string | undefined;
-      const parsed = rangeHeader
-        ? parseSingleRangeHeader(rangeHeader, sizeBytes)
-        : null;
 
-      // Only single-range requests are supported in v1.
-      if (rangeHeader && !parsed) {
-        reply.type("application/json");
-        return reply
-          .status(416)
-          .send({ error: "INVALID_RANGE", message: "Unsupported Range header" });
-      }
+      req.log.debug({ fileId, range: rangeHeader }, "stream request");
 
-      if (
-        parsed &&
-        Number.isFinite(WalrusReadLimits.maxRangeBytes) &&
-        WalrusReadLimits.maxRangeBytes > 0
-      ) {
-        const span = parsed.end - parsed.start + 1;
-        if (span > WalrusReadLimits.maxRangeBytes) {
+      let start = 0;
+      let end = sizeBytes - 1;
+      let status = 200;
+
+      if (rangeHeader) {
+        const parsedOrErr = parseSingleRangeHeader({
+          rangeHeader,
+          sizeBytes,
+        });
+
+        if ("error" in parsedOrErr) {
           reply.type("application/json");
           return reply.status(416).send({
-            error: "RANGE_TOO_LARGE",
-            message: `Range exceeds maxRangeBytes (${WalrusReadLimits.maxRangeBytes})`,
-            maxRangeBytes: WalrusReadLimits.maxRangeBytes,
+            error: "INVALID_RANGE",
+            message: "Unsupported Range header",
           });
         }
-      }
 
-      const upstreamRange =
-        parsed ? `bytes=${parsed.start}-${parsed.end}` : undefined;
+        start = parsedOrErr.range.start;
+        end = parsedOrErr.range.end;
+        status = 206;
+      }
 
       const abortController = new AbortController();
       const abortUpstream = () => abortController.abort();
-      // Best-effort: stop reading from Walrus if the client disconnects.
       req.raw.once("aborted", abortUpstream);
       req.raw.once("close", abortUpstream);
 
-      const upstream = await fetchWalrusBlob({
-        blobId,
-        rangeHeader: upstreamRange,
-        signal: abortController.signal,
-      });
+      const span = end - start + 1;
 
-      if (!upstream.ok && upstream.status !== 206) {
-        const text = await upstream.text().catch(() => "");
-        reply.type("application/json");
-        return reply.status(upstream.status).send({
-          error: "WALRUS_READ_FAILED",
-          status: upstream.status,
-          message: text || "Failed to read from Walrus aggregator",
-        });
-      }
-
-      // Strict HTTP Range semantics: if the client asked for a range and the upstream
-      // didn't return 206, don't fall back to a full-body response.
-      if (parsed && upstream.status !== 206) {
-        const text = await upstream.text().catch(() => "");
-        reply.type("application/json");
-        return reply.status(502).send({
-          error: "WALRUS_RANGE_UNSUPPORTED",
-          status: upstream.status,
-          message: text || "Upstream did not honor Range request",
-        });
-      }
-
-      // Pass through key headers that matter for playback/seek.
-      const copyHeaders = [
-        "content-length",
-        "content-range",
-        "accept-ranges",
-        "etag",
-        "last-modified",
-      ];
-      for (const h of copyHeaders) {
-        const v = upstream.headers.get(h);
-        if (v) reply.header(h, v);
-      }
-
-      // For successful reads, serve the asset's declared content type.
       reply.header("Content-Type", mimeType);
-      reply.status(upstream.status);
-      const body = upstream.body;
-      if (!body) return reply.send();
-      return reply.send(Readable.fromWeb(body as any));
+      reply.header("Content-Length", String(span));
+
+      if (status === 206) {
+        reply.header("Content-Range", `bytes ${start}-${end}/${sizeBytes}`);
+      }
+
+      const stream = Readable.from(
+        walrusByteStream({
+          blobId,
+          start,
+          end,
+          maxSegmentBytes: WalrusReadLimits.maxRangeBytes,
+          signal: abortController.signal,
+        })
+      );
+
+      return reply.status(status).send(stream);
     },
   });
 }
