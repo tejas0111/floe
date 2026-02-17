@@ -31,6 +31,40 @@ type ParsedRange = {
   end: number;
 };
 
+type NormalizedFileFields = {
+  blobId: string;
+  sizeBytes: number;
+  mimeType: string;
+  createdAt: number;
+  owner: unknown;
+};
+
+function normalizeFileFields(fields: any): NormalizedFileFields | null {
+  if (!fields || typeof fields !== "object") return null;
+
+  const blobId = typeof fields.blob_id === "string" ? fields.blob_id.trim() : "";
+  const rawSizeBytes = Number(fields.size_bytes);
+  const rawCreatedAt = Number(fields.created_at);
+  const mimeType =
+    typeof fields.mime === "string" && fields.mime.trim().length > 0
+      ? fields.mime
+      : "application/octet-stream";
+
+  if (!blobId) return null;
+  if (!Number.isFinite(rawSizeBytes) || !Number.isInteger(rawSizeBytes) || rawSizeBytes <= 0) {
+    return null;
+  }
+  if (!Number.isFinite(rawCreatedAt) || rawCreatedAt < 0) return null;
+
+  return {
+    blobId,
+    sizeBytes: rawSizeBytes,
+    mimeType,
+    createdAt: rawCreatedAt,
+    owner: fields.owner ?? null,
+  };
+}
+
 function parseSingleRangeHeader(params: {
   rangeHeader: string;
   sizeBytes: number;
@@ -125,6 +159,22 @@ async function* walrusByteStream(params: {
   maxSegmentBytes: number;
   signal: AbortSignal;
 }): AsyncGenerator<Uint8Array> {
+  const makeWalrusReadError = (upstreamStatus: number, upstreamBody: string) => {
+    const err = new Error(
+      `WALRUS_RANGE_FAILED status=${upstreamStatus} ${upstreamBody || ""}`.trim()
+    ) as Error & { statusCode?: number };
+
+    if (upstreamStatus === 404) {
+      err.statusCode = 404;
+      err.message = "FILE_CONTENT_NOT_FOUND";
+      return err;
+    }
+
+    // Upstream read errors should not be surfaced as a generic 500.
+    err.statusCode = upstreamStatus >= 500 ? 503 : 502;
+    return err;
+  };
+
   const maxSegmentBytes =
     Number.isFinite(params.maxSegmentBytes) && params.maxSegmentBytes > 0
       ? params.maxSegmentBytes
@@ -156,11 +206,15 @@ async function* walrusByteStream(params: {
         continue;
       }
 
-      if (upstream.status !== 206) {
+      const isFullObjectAttempt =
+        params.start === 0 && offset === 0 && segEnd === params.end;
+
+      if (upstream.status === 200 && isFullObjectAttempt) {
+        // Some aggregators return 200 for full-span requests even with a Range header.
+        // Accept this when we are fetching the whole object in one segment.
+      } else if (upstream.status !== 206) {
         const text = await upstream.text().catch(() => "");
-        throw new Error(
-          `WALRUS_RANGE_FAILED status=${upstream.status} ${text || ""}`.trim()
-        );
+        throw makeWalrusReadError(upstream.status, text);
       }
 
       const body = upstream.body;
@@ -222,22 +276,27 @@ export async function filesRoutes(app: FastifyInstance) {
       return res.status(404).send({ error: "FILE_NOT_FOUND" });
     }
 
+    const normalized = normalizeFileFields(fields);
+    if (!normalized) {
+      req.log.error({ fileId, fields }, "Invalid file metadata fields");
+      return res.status(502).send({
+        error: "INVALID_FILE_METADATA",
+        message: "File metadata is invalid",
+      });
+    }
+
     const exposeBlobId = shouldExposeBlobId(req);
-    const blobId = fields.blob_id;
-    const sizeBytes = Number(fields.size_bytes);
-    const mimeType = fields.mime;
-    const createdAt = Number(fields.created_at);
-    const container = inferContainerFromMime(mimeType);
+    const container = inferContainerFromMime(normalized.mimeType);
 
     return {
       fileId,
       manifestVersion: 1,
       container,
-      ...(exposeBlobId ? { blobId } : {}),
-      sizeBytes,
-      mimeType,
-      owner: fields.owner ?? null,
-      createdAt,
+      ...(exposeBlobId ? { blobId: normalized.blobId } : {}),
+      sizeBytes: normalized.sizeBytes,
+      mimeType: normalized.mimeType,
+      owner: normalized.owner,
+      createdAt: normalized.createdAt,
     };
   });
 
@@ -259,19 +318,24 @@ export async function filesRoutes(app: FastifyInstance) {
       return res.status(404).send({ error: "FILE_NOT_FOUND" });
     }
 
+    const normalized = normalizeFileFields(fields);
+    if (!normalized) {
+      req.log.error({ fileId, fields }, "Invalid file metadata fields");
+      return res.status(502).send({
+        error: "INVALID_FILE_METADATA",
+        message: "File metadata is invalid",
+      });
+    }
+
     const exposeBlobId = shouldExposeBlobId(req);
-    const blobId = fields.blob_id;
-    const sizeBytes = Number(fields.size_bytes);
-    const mimeType = fields.mime;
-    const createdAt = Number(fields.created_at);
-    const container = inferContainerFromMime(mimeType);
+    const container = inferContainerFromMime(normalized.mimeType);
 
     return {
       manifestVersion: 1,
       fileId,
-      createdAt,
-      sizeBytes,
-      mimeType,
+      createdAt: normalized.createdAt,
+      sizeBytes: normalized.sizeBytes,
+      mimeType: normalized.mimeType,
       container,
       layout: {
         type: "walrus_single_blob",
@@ -279,8 +343,8 @@ export async function filesRoutes(app: FastifyInstance) {
           {
             index: 0,
             offsetBytes: 0,
-            sizeBytes,
-            ...(exposeBlobId ? { blobId } : {}),
+            sizeBytes: normalized.sizeBytes,
+            ...(exposeBlobId ? { blobId: normalized.blobId } : {}),
           },
         ],
       },
@@ -310,9 +374,19 @@ export async function filesRoutes(app: FastifyInstance) {
         return reply.status(404).send({ error: "FILE_NOT_FOUND" });
       }
 
-      const blobId = fields.blob_id as string;
-      const sizeBytes = Number(fields.size_bytes);
-      const mimeType = fields.mime as string;
+      const normalized = normalizeFileFields(fields);
+      if (!normalized) {
+        req.log.error({ fileId, fields }, "Invalid file metadata fields");
+        reply.type("application/json");
+        return reply.status(502).send({
+          error: "INVALID_FILE_METADATA",
+          message: "File metadata is invalid",
+        });
+      }
+
+      const blobId = normalized.blobId;
+      const sizeBytes = normalized.sizeBytes;
+      const mimeType = normalized.mimeType;
 
       reply.header("Accept-Ranges", "bytes");
       reply.header("ETag", blobId);
@@ -358,6 +432,7 @@ export async function filesRoutes(app: FastifyInstance) {
       req.raw.once("close", abortUpstream);
 
       const span = end - start + 1;
+      const isWholeFileRead = !rangeHeader;
 
       reply.header("Content-Type", mimeType);
       reply.header("Content-Length", String(span));
@@ -371,7 +446,9 @@ export async function filesRoutes(app: FastifyInstance) {
           blobId,
           start,
           end,
-          maxSegmentBytes: WalrusReadLimits.maxRangeBytes,
+          // Whole-file reads may be served as HTTP 200 by some Walrus aggregators.
+          // Force one segment so the streamer can accept a full-object 200 response.
+          maxSegmentBytes: isWholeFileRead ? span : WalrusReadLimits.maxRangeBytes,
           signal: abortController.signal,
         })
       );

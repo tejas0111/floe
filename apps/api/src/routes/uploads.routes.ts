@@ -241,6 +241,8 @@ export default async function uploadRoutes(app: FastifyInstance) {
 
       return { ok: true, chunkIndex: idx };
     } catch (err: any) {
+      const message = err?.message ?? "Chunk upload failed";
+
       if (err?.message === "CHUNK_IN_PROGRESS") {
         log.info({ uploadId, idx }, "Chunk upload already in progress");
         return sendApiError(
@@ -251,12 +253,24 @@ export default async function uploadRoutes(app: FastifyInstance) {
           { retryable: true }
         );
       }
+
+      if (
+        err?.message === "HASH_MISMATCH" ||
+        err?.message === "CHUNK_TOO_LARGE" ||
+        err?.message === "CHUNK_SIZE_MISMATCH" ||
+        err?.message === "INVALID_LAST_CHUNK_SIZE"
+      ) {
+        return sendApiError(reply, 400, "INVALID_CHUNK", message, {
+          retryable: false,
+        });
+      }
+
       log.warn({ uploadId, idx, err }, "Chunk upload failed");
       return sendApiError(
         reply,
         500,
         "CHUNK_UPLOAD_FAILED",
-        err.message ?? "Chunk upload failed",
+        message,
         { retryable: true }
       );
     }
@@ -269,13 +283,31 @@ export default async function uploadRoutes(app: FastifyInstance) {
       return sendApiError(reply, 400, "INVALID_UPLOAD_ID", "uploadId must be a UUID");
     }
 
-    const session = await getSession(uploadId);
-    if (!session) {
-      return sendApiError(reply, 404, "UPLOAD_NOT_FOUND", "Invalid uploadId");
-    }
-
     const redis = getRedis();
-    const members = await redis.smembers(uploadKeys.chunks(uploadId));
+    const [session, meta, members] = await Promise.all([
+      getSession(uploadId),
+      redis.hgetall<Record<string, string>>(uploadKeys.meta(uploadId)),
+      redis.smembers(uploadKeys.chunks(uploadId)),
+    ]);
+
+    if (!session) {
+      const status = meta?.status;
+      if (!status) {
+        return sendApiError(reply, 404, "UPLOAD_NOT_FOUND", "Invalid uploadId");
+      }
+
+      return {
+        uploadId,
+        chunkSize: meta?.chunkSize ? Number(meta.chunkSize) : null,
+        totalChunks: meta?.totalChunks ? Number(meta.totalChunks) : null,
+        receivedChunks: members.map(Number).sort((a, b) => a - b),
+        expiresAt: meta?.expiresAt ? Number(meta.expiresAt) : null,
+        status,
+        ...(meta?.fileId ? { fileId: meta.fileId } : {}),
+        ...(meta?.blobId ? { blobId: meta.blobId } : {}),
+        ...(meta?.error ? { error: meta.error } : {}),
+      };
+    }
 
     return {
       uploadId,
@@ -295,12 +327,57 @@ export default async function uploadRoutes(app: FastifyInstance) {
       return sendApiError(reply, 400, "INVALID_UPLOAD_ID", "uploadId must be a UUID");
     }
 
-    const session = await getSession(uploadId);
+    const redis = getRedis();
+    const metaKey = uploadKeys.meta(uploadId);
+    const [session, meta] = await Promise.all([
+      getSession(uploadId),
+      redis.hgetall<Record<string, string>>(metaKey),
+    ]);
+
+    const metaStatus = meta?.status;
+
     if (!session) {
+      if (metaStatus === "completed") {
+        if (!meta?.fileId || !meta?.blobId) {
+          return sendApiError(
+            reply,
+            500,
+            "INTERNAL_ERROR",
+            "Completed upload metadata is corrupt"
+          );
+        }
+
+        return reply.code(200).send({
+          fileId: meta.fileId,
+          blobId: meta.blobId,
+          sizeBytes: Number(meta.sizeBytes ?? 0),
+          status: "ready",
+        });
+      }
+
+      if (metaStatus === "finalizing") {
+        return sendApiError(
+          reply,
+          409,
+          "UPLOAD_FINALIZATION_IN_PROGRESS",
+          "Upload is currently finalizing",
+          { retryable: true }
+        );
+      }
+
       return sendApiError(reply, 404, "UPLOAD_NOT_FOUND", "Invalid uploadId");
     }
 
-    if (session.status === "completed") {
+    if (session.status === "completed" || metaStatus === "completed") {
+      if (meta?.fileId && meta?.blobId) {
+        return reply.code(200).send({
+          fileId: meta.fileId,
+          blobId: meta.blobId,
+          sizeBytes: Number(meta.sizeBytes ?? session.sizeBytes),
+          status: "ready",
+        });
+      }
+
       return sendApiError(
         reply,
         409,
@@ -309,7 +386,6 @@ export default async function uploadRoutes(app: FastifyInstance) {
       );
     }
 
-    const redis = getRedis();
     const receivedChunks = await redis.scard(uploadKeys.chunks(uploadId));
 
     if (receivedChunks !== session.totalChunks) {
@@ -336,6 +412,16 @@ export default async function uploadRoutes(app: FastifyInstance) {
 
       return reply.code(200).send(result);
     } catch (err: any) {
+      if (err?.message === "UPLOAD_FINALIZATION_IN_PROGRESS") {
+        return sendApiError(
+          reply,
+          409,
+          "UPLOAD_FINALIZATION_IN_PROGRESS",
+          "Upload is currently finalizing",
+          { retryable: true }
+        );
+      }
+
       log.error({ uploadId, err }, "Upload finalization failed");
 
       return sendApiError(
