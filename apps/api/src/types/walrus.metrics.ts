@@ -21,6 +21,9 @@ export interface WalrusUploadMetric {
   outcome: WalrusUploadOutcome;
   error?: string;
   httpStatus?: number;
+  walrusCost?: number | string;
+  walrusObjectId?: string;
+  walrusEndEpoch?: number;
   network: "mainnet" | "testnet";
   timestamp: number;
 }
