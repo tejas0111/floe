@@ -35,6 +35,13 @@ function shouldExposeBlobId(query: any): boolean {
   return raw === "1" || raw === "true" || raw === true;
 }
 
+function createAdmissionLockKey(uploadId: string): string {
+  const bucketCount = 16;
+  const seed = uploadId.slice(0, 8);
+  const bucket = Number.parseInt(seed, 16) % bucketCount;
+  return `${uploadKeys.createLock()}:${bucket}`;
+}
+
 export default async function uploadRoutes(app: FastifyInstance) {
   app.post("/v1/uploads/create", async (req, reply) => {
     const log = req.log;
@@ -140,7 +147,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
 
     const redis = getRedis();
     const uploadId = crypto.randomUUID();
-    const createLockKey = uploadKeys.createLock();
+    const createLockKey = createAdmissionLockKey(uploadId);
     const createLockToken = crypto.randomUUID();
     const createLockAcquired = await redis.set(createLockKey, createLockToken, {
       nx: true,
