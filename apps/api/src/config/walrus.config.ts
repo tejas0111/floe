@@ -14,6 +14,16 @@ function assertHttpUrl(name: string, url: string) {
   }
 }
 
+function parsePositiveIntEnv(name: string, fallback: number, min = 1): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < min) {
+    throw new Error(`${name} must be an integer >= ${min}`);
+  }
+  return n;
+}
+
 if (!process.env.WALRUS_PUBLISHER_URL) {
   throw new Error("Missing required env: WALRUS_PUBLISHER_URL");
 }
@@ -40,17 +50,15 @@ export const WalrusEnv = {
 };
 
 export const WalrusReadLimits = {
-  timeoutMs: Number(process.env.WALRUS_READ_TIMEOUT_MS ?? 10 * 60_000),
+  timeoutMs: parsePositiveIntEnv("WALRUS_READ_TIMEOUT_MS", 10 * 60_000),
 
   // Max size for a single upstream Walrus Range request. Used to stitch large
   // reads into bounded segments so public aggregators can serve big files.
-  maxRangeBytes: Number(
-    process.env.FLOE_STREAM_MAX_RANGE_BYTES ?? 64 * 1024 * 1024
-  ),
+  maxRangeBytes: parsePositiveIntEnv("FLOE_STREAM_MAX_RANGE_BYTES", 64 * 1024 * 1024),
 
   // Retry budget per stitched segment (network errors, 5xx, 429).
-  maxSegmentRetries: Number(process.env.WALRUS_READ_MAX_RETRIES ?? 2),
-  baseRetryDelayMs: Number(process.env.WALRUS_READ_RETRY_DELAY_MS ?? 250),
+  maxSegmentRetries: parsePositiveIntEnv("WALRUS_READ_MAX_RETRIES", 2),
+  baseRetryDelayMs: parsePositiveIntEnv("WALRUS_READ_RETRY_DELAY_MS", 250),
 };
 
 export const WalrusEpochLimits = {
