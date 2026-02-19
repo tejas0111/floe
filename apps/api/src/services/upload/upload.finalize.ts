@@ -241,11 +241,19 @@ export async function finalizeUpload(session: InternalSession): Promise<{
       status: "ready",
     };
   } catch (err) {
-    await redis.hset(metaKey, {
-      status: "failed",
-      error: (err as Error).message,
-      failedAt: String(Date.now()),
-    });
+    const message = (err as Error).message;
+    const isLockOwnershipError =
+      message === "UPLOAD_FINALIZATION_LOCK_LOST" ||
+      message === "UPLOAD_FINALIZATION_IN_PROGRESS";
+
+    // If we no longer own the lock, avoid forcing terminal "failed" state.
+    if (!isLockOwnershipError) {
+      await redis.hset(metaKey, {
+        status: "failed",
+        error: message,
+        failedAt: String(Date.now()),
+      });
+    }
 
     throw err;
   } finally {
