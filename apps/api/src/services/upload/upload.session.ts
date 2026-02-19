@@ -79,6 +79,9 @@ export async function createSession(input: {
       status: "uploading",
       createdAt: String(now),
       expiresAt: String(expiresAt),
+      sizeBytes: String(sizeBytes),
+      chunkSize: String(chunkSize),
+      totalChunks: String(totalChunks),
     })
     .expire(uploadKeys.meta(uploadId), metaTtlSeconds)
 
@@ -152,4 +155,3 @@ export async function getSession(
     expiresAt,
   };
 }
-
