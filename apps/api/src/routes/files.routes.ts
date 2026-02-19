@@ -415,6 +415,7 @@ export async function filesRoutes(app: FastifyInstance) {
 
         if ("error" in parsedOrErr) {
           reply.type("application/json");
+          reply.header("Content-Range", `bytes */${sizeBytes}`);
           return reply.status(416).send({
             error: "INVALID_RANGE",
             message: "Unsupported Range header",
@@ -428,6 +429,10 @@ export async function filesRoutes(app: FastifyInstance) {
 
       const abortController = new AbortController();
       const abortUpstream = () => abortController.abort();
+      const detachAbortHooks = () => {
+        req.raw.removeListener("aborted", abortUpstream);
+        req.raw.removeListener("close", abortUpstream);
+      };
       req.raw.once("aborted", abortUpstream);
       req.raw.once("close", abortUpstream);
 
@@ -452,6 +457,9 @@ export async function filesRoutes(app: FastifyInstance) {
           signal: abortController.signal,
         })
       );
+      stream.once("end", detachAbortHooks);
+      stream.once("close", detachAbortHooks);
+      stream.once("error", detachAbortHooks);
 
       return reply.status(status).send(stream);
     },
