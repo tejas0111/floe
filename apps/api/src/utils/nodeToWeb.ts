@@ -2,12 +2,6 @@ import { Readable } from "stream";
 import { ReadableStream } from "stream/web";
 
 export function nodeToWeb(stream: Readable): ReadableStream {
-  return new ReadableStream({
-    start(controller) {
-      stream.on("data", chunk => controller.enqueue(chunk));
-      stream.on("end", () => controller.close());
-      stream.on("error", err => controller.error(err));
-    },
-  });
+  // Node 20+ provides a native bridge that preserves backpressure and cancelation.
+  return Readable.toWeb(stream) as ReadableStream;
 }
-

@@ -2,45 +2,15 @@
 
 import type { Readable } from "stream";
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519";
-import { fromB64, fromHEX, toB64 } from "@mysten/sui/utils";
-import { SuiClient } from "@mysten/sui/client";
-import { decodeSuiPrivateKey } from "@mysten/sui/cryptography";
+import { toB64 } from "@mysten/sui/utils";
 import { nodeToWeb } from "../../utils/nodeToWeb.js";
 import { WalrusEnv } from "../../config/walrus.config.js";
+import { suiClient, suiNetwork, suiSigner } from "../../sui/client.js";
 
-const MAINNET_RPC = "https://fullnode.mainnet.sui.io:443";
-const TESTNET_RPC = "https://fullnode.testnet.sui.io:443";
 const MIN_BALANCE_MIST = 1_000_000_000n;
 const FETCH_TIMEOUT_MS = 5 * 60 * 1000; // 5 min
 
-
-const NETWORK = (() => {
-  const net = process.env.FLOE_NETWORK;
-  if (net !== "mainnet" && net !== "testnet") {
-    throw new Error("FLOE_NETWORK must be 'mainnet' or 'testnet'");
-  }
-  return net;
-})();
-
-const IS_MAINNET = NETWORK === "mainnet";
-const SUI_RPC_URL = (() => {
-  const configured = process.env.SUI_RPC_URL?.trim();
-  const fallback = IS_MAINNET ? MAINNET_RPC : TESTNET_RPC;
-  const url = configured || fallback;
-
-  if (!/^https?:\/\//.test(url)) {
-    throw new Error("SUI_RPC_URL must start with http:// or https://");
-  }
-
-  if (IS_MAINNET && /testnet/i.test(url)) {
-    throw new Error("NETWORK_MISMATCH: mainnet Floe cannot use testnet Sui RPC");
-  }
-  if (!IS_MAINNET && /mainnet/i.test(url)) {
-    throw new Error("NETWORK_MISMATCH: testnet Floe cannot use mainnet Sui RPC");
-  }
-
-  return url;
-})();
+const IS_MAINNET = suiNetwork === "mainnet";
 
 const WALRUS_PUBLISHER_URL = (() => {
   const url = WalrusEnv.publisherUrl;
@@ -61,75 +31,12 @@ if (!IS_MAINNET && /mainnet/i.test(WALRUS_PUBLISHER_URL)) {
   );
 }
 
-let cachedKeypair: Ed25519Keypair | null = null;
 let lastBalanceCheck = 0;
-
-function loadWalletKeypair(): Ed25519Keypair {
-  if (cachedKeypair) return cachedKeypair;
-
-  const raw = process.env.SUI_PRIVATE_KEY;
-  if (!raw) throw new Error("SUI_PRIVATE_KEY not set");
-
-  const key = raw.trim();
-
-  if (key.startsWith("suiprivkey1")) {
-    const { schema, secretKey } = decodeSuiPrivateKey(key);
-    if (schema !== "ED25519") {
-      throw new Error(`Unsupported key schema: ${schema}`);
-    }
-    cachedKeypair = Ed25519Keypair.fromSecretKey(secretKey);
-    return cachedKeypair;
-  }
-
-  if (key.startsWith("[")) {
-    try {
-      const arr = JSON.parse(key);
-      cachedKeypair = Ed25519Keypair.fromSecretKey(
-        Uint8Array.from(arr).slice(0, 32)
-      );
-      return cachedKeypair;
-    } catch (err: any) {
-      throw new Error(
-        `Invalid JSON array SUI_PRIVATE_KEY: ${err?.message ?? "parse error"}`
-      );
-    }
-  }
-
-  if (/^[A-Za-z0-9+/]+=*$/.test(key)) {
-    try {
-      cachedKeypair = Ed25519Keypair.fromSecretKey(fromB64(key));
-      return cachedKeypair;
-    } catch (err: any) {
-      throw new Error(
-        `Invalid base64 SUI_PRIVATE_KEY: ${err?.message ?? "decode error"}`
-      );
-    }
-  }
-
-  if (/^(0x)?[0-9a-fA-F]+$/.test(key)) {
-    try {
-      cachedKeypair = Ed25519Keypair.fromSecretKey(
-        fromHEX(key.replace(/^0x/, "")).slice(0, 32)
-      );
-      return cachedKeypair;
-    } catch (err: any) {
-      throw new Error(
-        `Invalid hex SUI_PRIVATE_KEY: ${err?.message ?? "decode error"}`
-      );
-    }
-  }
-
-  throw new Error("Unrecognized SUI_PRIVATE_KEY format");
-}
-
-async function checkBalanceOnce(
-  client: SuiClient,
-  address: string
-) {
+async function checkBalanceOnce(clientAddress: string) {
   const now = Date.now();
   if (now - lastBalanceCheck < 60_000) return;
 
-  const bal = await client.getBalance({ owner: address });
+  const bal = await suiClient.getBalance({ owner: clientAddress });
   if (BigInt(bal.totalBalance) < MIN_BALANCE_MIST) {
     throw new Error("INSUFFICIENT_BALANCE");
   }
@@ -174,13 +81,9 @@ export async function uploadToWalrusOnce(
   };
 
   if (IS_MAINNET) {
-    const keypair = loadWalletKeypair();
-    const client = new SuiClient({ url: SUI_RPC_URL });
+    const keypair = suiSigner;
 
-    await checkBalanceOnce(
-      client,
-      keypair.getPublicKey().toSuiAddress()
-    );
+    await checkBalanceOnce(keypair.getPublicKey().toSuiAddress());
 
     Object.assign(headers, await createAuthHeaders(keypair));
   }

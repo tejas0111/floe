@@ -29,6 +29,12 @@ function finalBinPath(uploadId: string) {
   return path.join(UploadConfig.tmpDir, `${uploadId}.bin`);
 }
 
+function shouldExposeBlobId(query: any): boolean {
+  if (process.env.FLOE_EXPOSE_BLOB_ID === "1") return true;
+  const raw = query?.includeBlobId ?? query?.include_blob_id ?? query?.includeStorage;
+  return raw === "1" || raw === "true" || raw === true;
+}
+
 export default async function uploadRoutes(app: FastifyInstance) {
   app.post("/v1/uploads/create", async (req, reply) => {
     const log = req.log;
@@ -133,16 +139,32 @@ export default async function uploadRoutes(app: FastifyInstance) {
     }
 
     const redis = getRedis();
-    const activeUploads = await redis.scard(uploadKeys.gcIndex());
-    if (activeUploads >= UploadConfig.maxActiveUploads) {
-      return sendApiError(reply, 429, "UPLOAD_CAPACITY_REACHED", "Too many active uploads", {
-        retryable: true,
-      });
+    const uploadId = crypto.randomUUID();
+    const createLockKey = uploadKeys.createLock();
+    const createLockToken = crypto.randomUUID();
+    const createLockAcquired = await redis.set(createLockKey, createLockToken, {
+      nx: true,
+      px: 5_000,
+    });
+
+    if (!createLockAcquired) {
+      return sendApiError(
+        reply,
+        503,
+        "RATE_LIMITED",
+        "Upload creation is busy, retry shortly",
+        { retryable: true }
+      );
     }
 
-    const uploadId = crypto.randomUUID();
-
     try {
+      const activeUploads = await redis.scard(uploadKeys.gcIndex());
+      if (activeUploads >= UploadConfig.maxActiveUploads) {
+        return sendApiError(reply, 429, "UPLOAD_CAPACITY_REACHED", "Too many active uploads", {
+          retryable: true,
+        });
+      }
+
       const session = await createSession({
         uploadId,
         filename,
@@ -173,6 +195,11 @@ export default async function uploadRoutes(app: FastifyInstance) {
           retryable: true,
         }
       );
+    } finally {
+      const currentLockValue = await redis.get<string>(createLockKey).catch(() => null);
+      if (currentLockValue === createLockToken) {
+        await redis.del(createLockKey).catch(() => {});
+      }
     }
   });
 
@@ -278,6 +305,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
 
   app.get("/v1/uploads/:uploadId/status", async (req, reply) => {
     const { uploadId } = req.params as { uploadId: string };
+    const exposeBlobId = shouldExposeBlobId((req as any).query);
 
     if (!isUuid(uploadId)) {
       return sendApiError(reply, 400, "INVALID_UPLOAD_ID", "uploadId must be a UUID");
@@ -304,7 +332,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
         expiresAt: meta?.expiresAt ? Number(meta.expiresAt) : null,
         status,
         ...(meta?.fileId ? { fileId: meta.fileId } : {}),
-        ...(meta?.blobId ? { blobId: meta.blobId } : {}),
+        ...(exposeBlobId && meta?.blobId ? { blobId: meta.blobId } : {}),
         ...(meta?.error ? { error: meta.error } : {}),
       };
     }

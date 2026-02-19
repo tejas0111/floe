@@ -4,6 +4,7 @@ import fs from "fs/promises";
 import path from "path";
 import { createWriteStream, createReadStream } from "fs";
 import { once } from "events";
+import crypto from "crypto";
 
 import { UploadConfig } from "../../config/uploads.config.js";
 import { InternalSession } from "./upload.session.js";
@@ -15,6 +16,38 @@ import { finalizeFileMetadata } from "../../sui/file.metadata.js";
 
 const finalFilePath = (uploadId: string) =>
   path.join(UploadConfig.tmpDir, `${uploadId}.bin`);
+
+const FINALIZE_LOCK_TTL_SECONDS = 15 * 60;
+const FINALIZE_LOCK_REFRESH_INTERVAL_MS = 60_000;
+
+async function assembleChunksToFile(params: {
+  uploadId: string;
+  totalChunks: number;
+  outPath: string;
+}) {
+  const ws = createWriteStream(params.outPath, { flags: "w" });
+  const finished = once(ws, "finish");
+  const failed = once(ws, "error").then(([err]) => {
+    throw err;
+  });
+
+  try {
+    for (let i = 0; i < params.totalChunks; i++) {
+      const rs = chunkStore.openChunk(params.uploadId, i);
+      for await (const buf of rs) {
+        if (!ws.write(buf)) {
+          await once(ws, "drain");
+        }
+      }
+    }
+
+    ws.end();
+    await Promise.race([finished, failed]);
+  } catch (err) {
+    ws.destroy();
+    throw err;
+  }
+}
 
 export async function finalizeUpload(session: InternalSession): Promise<{
   fileId: string;
@@ -42,14 +75,35 @@ export async function finalizeUpload(session: InternalSession): Promise<{
   }
 
   const lockKey = `${metaKey}:lock`;
-  const locked = await redis.set(lockKey, "1", {
+  const lockToken = crypto.randomUUID();
+  const locked = await redis.set(lockKey, lockToken, {
     nx: true,
-    px: 15 * 60 * 1000,
+    ex: FINALIZE_LOCK_TTL_SECONDS,
   });
 
   if (!locked) {
     throw new Error("UPLOAD_FINALIZATION_IN_PROGRESS");
   }
+
+  const refreshFinalizeLock = async () => {
+    const current = await redis.get<string>(lockKey);
+    if (current !== lockToken) {
+      throw new Error("UPLOAD_FINALIZATION_LOCK_LOST");
+    }
+    await redis.expire(lockKey, FINALIZE_LOCK_TTL_SECONDS);
+  };
+
+  let lockError: Error | null = null;
+  const lockRefreshTimer = setInterval(() => {
+    void refreshFinalizeLock().catch((err) => {
+      lockError = err instanceof Error ? err : new Error("UPLOAD_FINALIZATION_LOCK_LOST");
+    });
+  }, FINALIZE_LOCK_REFRESH_INTERVAL_MS);
+  lockRefreshTimer.unref();
+
+  const assertFinalizeLockHealthy = () => {
+    if (lockError) throw lockError;
+  };
 
   try {
     // Re-check inside the lock (race-safe).
@@ -93,20 +147,16 @@ export async function finalizeUpload(session: InternalSession): Promise<{
 
     // Only assemble/upload if we don't already have a durable blobId checkpoint.
     if (!blobId) {
-      const ws = createWriteStream(outPath, { flags: "w" });
+      assertFinalizeLockHealthy();
+      await refreshFinalizeLock();
+      await assembleChunksToFile({
+        uploadId,
+        totalChunks: session.totalChunks,
+        outPath,
+      });
 
-      for (let i = 0; i < session.totalChunks; i++) {
-        const rs = chunkStore.openChunk(uploadId, i);
-        for await (const buf of rs) {
-          if (!ws.write(buf)) {
-            await once(ws, "drain");
-          }
-        }
-      }
-
-      ws.end();
-      await once(ws, "finish");
-
+      assertFinalizeLockHealthy();
+      await refreshFinalizeLock();
       const result = await uploadToWalrusWithMetrics({
         uploadId,
         sizeBytes: session.sizeBytes,
@@ -128,6 +178,8 @@ export async function finalizeUpload(session: InternalSession): Promise<{
     }
 
     if (!fileId) {
+      assertFinalizeLockHealthy();
+      await refreshFinalizeLock();
       const minted = await finalizeFileMetadata({
         blobId,
         sizeBytes: session.sizeBytes,
@@ -197,6 +249,10 @@ export async function finalizeUpload(session: InternalSession): Promise<{
 
     throw err;
   } finally {
-    await redis.del(lockKey);
+    clearInterval(lockRefreshTimer);
+    const current = await redis.get<string>(lockKey).catch(() => null);
+    if (current === lockToken) {
+      await redis.del(lockKey).catch(() => {});
+    }
   }
 }
