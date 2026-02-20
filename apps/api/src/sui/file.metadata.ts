@@ -26,7 +26,7 @@ export async function finalizeFileMetadata(
   const tx = new Transaction();
 
   tx.moveCall({
-    target: `${SUI_PACKAGE_ID}::file::create`,
+    target: `${SUI_PACKAGE_ID}::file::create_with_owner`,
     arguments: [
       tx.pure.string(input.blobId),
       tx.pure.u64(input.sizeBytes),
