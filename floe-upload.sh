@@ -15,6 +15,16 @@ MAX_RETRIES=3
 KEEP_STATE=0
 STATE_DIR_OVERRIDE=""
 STATE_FILE_OVERRIDE=""
+API_KEY="${FLOE_API_KEY:-}"
+BEARER_TOKEN="${FLOE_BEARER_TOKEN:-}"
+AUTH_USER="${FLOE_AUTH_USER:-}"
+WALLET_ADDRESS="${FLOE_WALLET_ADDRESS:-}"
+OWNER_ADDRESS="${FLOE_OWNER_ADDRESS:-}"
+PUBLIC_MAX_FILE_SIZE_BYTES="${FLOE_PUBLIC_MAX_FILE_SIZE_BYTES:-$((100 * 1024 * 1024))}"
+AUTH_MAX_FILE_SIZE_BYTES="${FLOE_AUTH_MAX_FILE_SIZE_BYTES:-$((15 * 1024 * 1024 * 1024))}"
+GLOBAL_MAX_FILE_SIZE_BYTES="${FLOE_GLOBAL_MAX_FILE_SIZE_BYTES:-$((15 * 1024 * 1024 * 1024))}"
+
+declare -a CURL_AUTH_HEADERS=()
 
 # API
 API_BASE="${FLOE_API_BASE:-http://localhost:3001/v1/uploads}"
@@ -46,6 +56,11 @@ show_help() {
   echo "      --state <path>    Override state file path (disables auto state naming)"
   echo "      --state-dir <dir> Store state files under this directory"
   echo "      --keep-state      Keep the state file after a successful upload"
+  echo "      --api-key <key>   Auth header: x-api-key"
+  echo "      --bearer <token>  Auth header: Authorization: Bearer <token>"
+  echo "      --auth-user <id>  Auth header: x-auth-user"
+  echo "      --wallet <addr>   Auth header: x-wallet-address (0x...)"
+  echo "      --owner <addr>    Auth header: x-owner-address (0x...)"
   echo "  -h, --help            Show help"
   exit 0
 }
@@ -65,6 +80,11 @@ while [[ $# -gt 0 ]]; do
     --state) STATE_FILE_OVERRIDE="$2"; shift ;;
     --state-dir) STATE_DIR_OVERRIDE="$2"; shift ;;
     --keep-state) KEEP_STATE=1 ;;
+    --api-key) API_KEY="$2"; shift ;;
+    --bearer) BEARER_TOKEN="$2"; shift ;;
+    --auth-user) AUTH_USER="$2"; shift ;;
+    --wallet) WALLET_ADDRESS="$2"; shift ;;
+    --owner) OWNER_ADDRESS="$2"; shift ;;
     -h|--help) show_help ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
@@ -93,9 +113,63 @@ if ! [[ "$EPOCHS" =~ ^[0-9]+$ ]] || [[ "$EPOCHS" -le 0 ]]; then
   exit 1
 fi
 
+if [[ -n "$WALLET_ADDRESS" ]] && ! [[ "$WALLET_ADDRESS" =~ ^(0x)?[0-9a-fA-F]{64}$ ]]; then
+  echo "Invalid --wallet value (expected 0x + 64 hex chars)" >&2
+  exit 1
+fi
+
+if [[ -n "$OWNER_ADDRESS" ]] && ! [[ "$OWNER_ADDRESS" =~ ^(0x)?[0-9a-fA-F]{64}$ ]]; then
+  echo "Invalid --owner value (expected 0x + 64 hex chars)" >&2
+  exit 1
+fi
+
+append_auth_headers() {
+  local token="${1:-}"
+  if [[ -n "$API_KEY" ]]; then
+    CURL_AUTH_HEADERS+=(-H "x-api-key: $API_KEY")
+  fi
+  if [[ -n "$token" ]]; then
+    CURL_AUTH_HEADERS+=(-H "Authorization: Bearer $token")
+  fi
+  if [[ -n "$AUTH_USER" ]]; then
+    CURL_AUTH_HEADERS+=(-H "x-auth-user: $AUTH_USER")
+  fi
+  if [[ -n "$WALLET_ADDRESS" ]]; then
+    CURL_AUTH_HEADERS+=(-H "x-wallet-address: $WALLET_ADDRESS")
+  fi
+  if [[ -n "$OWNER_ADDRESS" ]]; then
+    CURL_AUTH_HEADERS+=(-H "x-owner-address: $OWNER_ADDRESS")
+  fi
+}
+
+append_auth_headers "$BEARER_TOKEN"
+
 FILE_SIZE=$(stat -c%s "$FILE_TO_UPLOAD" 2>/dev/null || stat -f%z "$FILE_TO_UPLOAD")
 CONTENT_TYPE=$(file --mime-type -b "$FILE_TO_UPLOAD" 2>/dev/null || echo "application/octet-stream")
 TMP_DIR="$(mktemp -d -t floe-upload-XXXXXX)"
+
+is_authenticated=0
+if [[ -n "$API_KEY" || -n "$BEARER_TOKEN" || -n "$AUTH_USER" || -n "$WALLET_ADDRESS" || -n "$OWNER_ADDRESS" ]]; then
+  is_authenticated=1
+fi
+
+tier_max_file_size="$PUBLIC_MAX_FILE_SIZE_BYTES"
+if [[ "$is_authenticated" -eq 1 ]]; then
+  tier_max_file_size="$AUTH_MAX_FILE_SIZE_BYTES"
+fi
+
+effective_max_file_size="$tier_max_file_size"
+if (( GLOBAL_MAX_FILE_SIZE_BYTES < effective_max_file_size )); then
+  effective_max_file_size="$GLOBAL_MAX_FILE_SIZE_BYTES"
+fi
+
+if (( FILE_SIZE > effective_max_file_size )); then
+  echo "File too large for this auth tier: ${FILE_SIZE} > ${effective_max_file_size} bytes" >&2
+  if [[ "$is_authenticated" -eq 0 ]]; then
+    echo "Tip: use auth headers/tokens to use higher limits." >&2
+  fi
+  exit 1
+fi
 
 resolve_abs_path() {
   local p="$1"
@@ -153,6 +227,7 @@ curl_json() {
       --retry-delay "$CURL_RETRY_DELAY_S" \
       --retry-all-errors \
       -X "$method" "$url" \
+      "${CURL_AUTH_HEADERS[@]}" \
       -H "Content-Type: application/json" \
       -d "$data"
   else
@@ -162,7 +237,8 @@ curl_json() {
       --retry "$CURL_RETRY" \
       --retry-delay "$CURL_RETRY_DELAY_S" \
       --retry-all-errors \
-      -X "$method" "$url"
+      -X "$method" "$url" \
+      "${CURL_AUTH_HEADERS[@]}"
   fi
 }
 
@@ -258,6 +334,11 @@ echo -e "${CYAN}║              FLOE V1 UPLOADER              ║${NC}"
 echo -e "${CYAN}╚════════════════════════════════════════════╝${NC}"
 echo ""
 echo -e "${YELLOW}API:${NC} $API_BASE"
+if [[ -n "$API_KEY" || -n "$BEARER_TOKEN" || -n "$AUTH_USER" || -n "$WALLET_ADDRESS" || -n "$OWNER_ADDRESS" ]]; then
+  echo -e "${YELLOW}Auth:${NC} enabled"
+else
+  echo -e "${YELLOW}Auth:${NC} public"
+fi
 echo -e "${YELLOW}File:${NC} $(basename "$FILE_TO_UPLOAD")"
 echo -e "${YELLOW}Size:${NC} $(numfmt --to=iec-i "$FILE_SIZE")"
 echo -e "${YELLOW}Type:${NC} $CONTENT_TYPE"
@@ -286,6 +367,7 @@ if [[ -n "$RESUME_UPLOAD_ID" ]]; then
     --retry-delay "$CURL_RETRY_DELAY_S" \
     -o "$STATUS_FILE" \
     -w "%{http_code}" \
+    "${CURL_AUTH_HEADERS[@]}" \
     -X GET "$API_BASE/$RESUME_UPLOAD_ID/status" || true)
 
   if [[ "$HTTP" =~ ^2 ]]; then
@@ -406,6 +488,7 @@ upload_chunk() {
       --retry-all-errors \
       -o "$resp_file" \
       -w "%{http_code}" \
+      "${CURL_AUTH_HEADERS[@]}" \
       -X PUT "$API_BASE/$UPLOAD_ID/chunk/$idx" \
       -H "x-chunk-sha256: $hash" \
       -F "chunk=@$file" || true)
@@ -455,6 +538,7 @@ HTTP=$(curl -sS \
   --retry-all-errors \
   -o "$FINAL_FILE" \
   -w "%{http_code}" \
+  "${CURL_AUTH_HEADERS[@]}" \
   -X POST "$API_BASE/$UPLOAD_ID/complete" || true)
 
 if ! [[ "$HTTP" =~ ^2 ]]; then
