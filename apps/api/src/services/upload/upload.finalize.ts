@@ -20,6 +20,41 @@ const finalFilePath = (uploadId: string) =>
 const FINALIZE_LOCK_TTL_SECONDS = 15 * 60;
 const FINALIZE_LOCK_REFRESH_INTERVAL_MS = 60_000;
 
+async function refreshFinalizeLockAtomic(params: {
+  lockKey: string;
+  lockToken: string;
+  ttlSeconds: number;
+}): Promise<boolean> {
+  const redis = getRedis();
+  const script = `
+    if redis.call("GET", KEYS[1]) == ARGV[1] then
+      return redis.call("EXPIRE", KEYS[1], tonumber(ARGV[2]))
+    end
+    return 0
+  `;
+  const res = await redis.eval(
+    script,
+    [params.lockKey],
+    [params.lockToken, String(params.ttlSeconds)]
+  );
+  return Number(res) === 1;
+}
+
+async function releaseFinalizeLockAtomic(params: {
+  lockKey: string;
+  lockToken: string;
+}): Promise<boolean> {
+  const redis = getRedis();
+  const script = `
+    if redis.call("GET", KEYS[1]) == ARGV[1] then
+      return redis.call("DEL", KEYS[1])
+    end
+    return 0
+  `;
+  const res = await redis.eval(script, [params.lockKey], [params.lockToken]);
+  return Number(res) === 1;
+}
+
 async function assembleChunksToFile(params: {
   uploadId: string;
   totalChunks: number;
@@ -86,11 +121,14 @@ export async function finalizeUpload(session: InternalSession): Promise<{
   }
 
   const refreshFinalizeLock = async () => {
-    const current = await redis.get<string>(lockKey);
-    if (current !== lockToken) {
+    const refreshed = await refreshFinalizeLockAtomic({
+      lockKey,
+      lockToken,
+      ttlSeconds: FINALIZE_LOCK_TTL_SECONDS,
+    });
+    if (!refreshed) {
       throw new Error("UPLOAD_FINALIZATION_LOCK_LOST");
     }
-    await redis.expire(lockKey, FINALIZE_LOCK_TTL_SECONDS);
   };
 
   let lockError: Error | null = null;
@@ -184,7 +222,7 @@ export async function finalizeUpload(session: InternalSession): Promise<{
         blobId,
         sizeBytes: session.sizeBytes,
         mimeType: session.contentType ?? "application/octet-stream",
-        owner: undefined,
+        owner: session.owner,
       });
 
       fileId = minted.fileId;
@@ -198,7 +236,7 @@ export async function finalizeUpload(session: InternalSession): Promise<{
             size_bytes: session.sizeBytes,
             mime: session.contentType ?? "application/octet-stream",
             created_at: Date.now(),
-            owner: null,
+            owner: session.owner ?? null,
           }),
           {
             px: Number(process.env.FLOE_FILE_FIELDS_CACHE_TTL_MS ?? 24 * 60 * 60_000),
@@ -213,9 +251,13 @@ export async function finalizeUpload(session: InternalSession): Promise<{
       });
     }
 
+    assertFinalizeLockHealthy();
+    await refreshFinalizeLock();
     await chunkStore.cleanup(uploadId);
     await fs.unlink(outPath).catch(() => {});
 
+    assertFinalizeLockHealthy();
+    await refreshFinalizeLock();
     const tx = await redis
       .multi()
       .hset(metaKey, {
@@ -258,9 +300,6 @@ export async function finalizeUpload(session: InternalSession): Promise<{
     throw err;
   } finally {
     clearInterval(lockRefreshTimer);
-    const current = await redis.get<string>(lockKey).catch(() => null);
-    if (current === lockToken) {
-      await redis.del(lockKey).catch(() => {});
-    }
+    await releaseFinalizeLockAtomic({ lockKey, lockToken }).catch(() => {});
   }
 }
