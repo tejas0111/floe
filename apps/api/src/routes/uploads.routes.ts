@@ -8,9 +8,11 @@ import path from "path";
 import { sendApiError } from "../utils/apiError.js";
 import { ChunkConfig, UploadConfig } from "../config/uploads.config.js";
 import { WalrusEpochLimits } from "../config/walrus.config.js";
+import { AuthUploadPolicyConfig } from "../config/auth.config.js";
 
 import { createSession, getSession } from "../services/upload/upload.session.js";
 import { finalizeUpload } from "../services/upload/upload.finalize.js";
+import { checkTieredRateLimit } from "../services/auth/auth.rate-limit.js";
 
 import { chunkStore } from "../store/index.js";
 import { getRedis } from "../state/client.js";
@@ -35,17 +37,52 @@ function shouldExposeBlobId(query: any): boolean {
   return raw === "1" || raw === "true" || raw === true;
 }
 
-function createAdmissionLockKey(uploadId: string): string {
-  const bucketCount = 16;
-  const seed = uploadId.slice(0, 8);
-  const bucket = Number.parseInt(seed, 16) % bucketCount;
-  return `${uploadKeys.createLock()}:${bucket}`;
+async function tryReserveUploadCapacity(params: {
+  maxActiveUploads: number;
+  uploadId: string;
+}): Promise<boolean> {
+  const redis = getRedis();
+  const script = `
+    local key = KEYS[1]
+    local max = tonumber(ARGV[1])
+    local uploadId = ARGV[2]
+    local count = tonumber(redis.call("SCARD", key))
+    if count >= max then
+      return 0
+    end
+    redis.call("SADD", key, uploadId)
+    return 1
+  `;
+
+  const reserved = await redis.eval(
+    script,
+    [uploadKeys.gcIndex()],
+    [String(params.maxActiveUploads), params.uploadId]
+  );
+
+  return Number(reserved) === 1;
 }
 
 export default async function uploadRoutes(app: FastifyInstance) {
   app.post("/v1/uploads/create", async (req, reply) => {
     const log = req.log;
     const body = req.body as any;
+    const createLimit = await checkTieredRateLimit({
+      req,
+      scope: "upload_control",
+    });
+    if (!createLimit.allowed) {
+      return sendApiError(reply, 429, "RATE_LIMITED", "Rate limit exceeded", {
+        retryable: true,
+        details: {
+          limit: createLimit.limit,
+          current: createLimit.current,
+          windowSeconds: createLimit.windowSeconds,
+          authenticated: createLimit.identity.authenticated,
+          authMethod: createLimit.identity.method,
+        },
+      });
+    }
 
     if (!body || typeof body !== "object") {
       return sendApiError(
@@ -90,12 +127,20 @@ export default async function uploadRoutes(app: FastifyInstance) {
       return sendApiError(reply, 400, "INVALID_FILE_SIZE", "sizeBytes must be positive");
     }
 
-    if (fileSizeNum > UploadConfig.maxFileSizeBytes) {
+    const tierMaxFileSizeBytes = createLimit.identity.authenticated
+      ? AuthUploadPolicyConfig.maxFileSizeBytes.authenticated
+      : AuthUploadPolicyConfig.maxFileSizeBytes.public;
+    const effectiveMaxFileSizeBytes = Math.min(
+      UploadConfig.maxFileSizeBytes,
+      tierMaxFileSizeBytes
+    );
+
+    if (fileSizeNum > effectiveMaxFileSizeBytes) {
       return sendApiError(
         reply,
         413,
         "FILE_TOO_LARGE",
-        `File exceeds maxFileSizeBytes (${UploadConfig.maxFileSizeBytes})`
+        `File exceeds maxFileSizeBytes (${effectiveMaxFileSizeBytes})`
       );
     }
 
@@ -145,42 +190,32 @@ export default async function uploadRoutes(app: FastifyInstance) {
       );
     }
 
-    const redis = getRedis();
     const uploadId = crypto.randomUUID();
-    const createLockKey = createAdmissionLockKey(uploadId);
-    const createLockToken = crypto.randomUUID();
-    const createLockAcquired = await redis.set(createLockKey, createLockToken, {
-      nx: true,
-      px: 5_000,
+    const redis = getRedis();
+    const capacityReserved = await tryReserveUploadCapacity({
+      maxActiveUploads: UploadConfig.maxActiveUploads,
+      uploadId,
     });
 
-    if (!createLockAcquired) {
-      return sendApiError(
-        reply,
-        503,
-        "RATE_LIMITED",
-        "Upload creation is busy, retry shortly",
-        { retryable: true }
-      );
+    if (!capacityReserved) {
+      return sendApiError(reply, 429, "UPLOAD_CAPACITY_REACHED", "Too many active uploads", {
+        retryable: true,
+      });
     }
 
+    let sessionCreated = false;
     try {
-      const activeUploads = await redis.scard(uploadKeys.gcIndex());
-      if (activeUploads >= UploadConfig.maxActiveUploads) {
-        return sendApiError(reply, 429, "UPLOAD_CAPACITY_REACHED", "Too many active uploads", {
-          retryable: true,
-        });
-      }
-
       const session = await createSession({
         uploadId,
         filename,
         contentType,
+        owner: createLimit.identity.owner,
         sizeBytes: fileSizeNum,
         chunkSize: resolvedChunkSize,
         totalChunks,
         epochs: resolvedEpochs,
       });
+      sessionCreated = true;
 
       log.info({ uploadId, totalChunks }, "Upload session created");
 
@@ -203,9 +238,16 @@ export default async function uploadRoutes(app: FastifyInstance) {
         }
       );
     } finally {
-      const currentLockValue = await redis.get<string>(createLockKey).catch(() => null);
-      if (currentLockValue === createLockToken) {
-        await redis.del(createLockKey).catch(() => {});
+      // If session creation failed, release reservation.
+      if (!sessionCreated) {
+        await redis
+          .multi()
+          .del(uploadKeys.session(uploadId))
+          .del(uploadKeys.meta(uploadId))
+          .del(uploadKeys.chunks(uploadId))
+          .srem(uploadKeys.gcIndex(), uploadId)
+          .exec()
+          .catch(() => {});
       }
     }
   });
@@ -213,6 +255,22 @@ export default async function uploadRoutes(app: FastifyInstance) {
   app.put("/v1/uploads/:uploadId/chunk/:index", async (req, reply) => {
     const log = req.log;
     const { uploadId, index } = req.params as any;
+    const chunkLimit = await checkTieredRateLimit({
+      req,
+      scope: "upload_chunk",
+    });
+    if (!chunkLimit.allowed) {
+      return sendApiError(reply, 429, "RATE_LIMITED", "Rate limit exceeded", {
+        retryable: true,
+        details: {
+          limit: chunkLimit.limit,
+          current: chunkLimit.current,
+          windowSeconds: chunkLimit.windowSeconds,
+          authenticated: chunkLimit.identity.authenticated,
+          authMethod: chunkLimit.identity.method,
+        },
+      });
+    }
 
     if (!isUuid(uploadId)) {
       return sendApiError(reply, 400, "INVALID_UPLOAD_ID", "uploadId must be a UUID");
@@ -313,6 +371,22 @@ export default async function uploadRoutes(app: FastifyInstance) {
   app.get("/v1/uploads/:uploadId/status", async (req, reply) => {
     const { uploadId } = req.params as { uploadId: string };
     const exposeBlobId = shouldExposeBlobId((req as any).query);
+    const statusLimit = await checkTieredRateLimit({
+      req,
+      scope: "upload_control",
+    });
+    if (!statusLimit.allowed) {
+      return sendApiError(reply, 429, "RATE_LIMITED", "Rate limit exceeded", {
+        retryable: true,
+        details: {
+          limit: statusLimit.limit,
+          current: statusLimit.current,
+          windowSeconds: statusLimit.windowSeconds,
+          authenticated: statusLimit.identity.authenticated,
+          authMethod: statusLimit.identity.method,
+        },
+      });
+    }
 
     if (!isUuid(uploadId)) {
       return sendApiError(reply, 400, "INVALID_UPLOAD_ID", "uploadId must be a UUID");
@@ -357,6 +431,23 @@ export default async function uploadRoutes(app: FastifyInstance) {
   app.post("/v1/uploads/:uploadId/complete", async (req, reply) => {
     const log = req.log;
     const { uploadId } = req.params as { uploadId: string };
+    const exposeBlobId = shouldExposeBlobId((req as any).query);
+    const completeLimit = await checkTieredRateLimit({
+      req,
+      scope: "upload_control",
+    });
+    if (!completeLimit.allowed) {
+      return sendApiError(reply, 429, "RATE_LIMITED", "Rate limit exceeded", {
+        retryable: true,
+        details: {
+          limit: completeLimit.limit,
+          current: completeLimit.current,
+          windowSeconds: completeLimit.windowSeconds,
+          authenticated: completeLimit.identity.authenticated,
+          authMethod: completeLimit.identity.method,
+        },
+      });
+    }
 
     if (!isUuid(uploadId)) {
       return sendApiError(reply, 400, "INVALID_UPLOAD_ID", "uploadId must be a UUID");
@@ -384,7 +475,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
 
         return reply.code(200).send({
           fileId: meta.fileId,
-          blobId: meta.blobId,
+          ...(exposeBlobId ? { blobId: meta.blobId } : {}),
           sizeBytes: Number(meta.sizeBytes ?? 0),
           status: "ready",
         });
@@ -407,7 +498,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
       if (meta?.fileId && meta?.blobId) {
         return reply.code(200).send({
           fileId: meta.fileId,
-          blobId: meta.blobId,
+          ...(exposeBlobId ? { blobId: meta.blobId } : {}),
           sizeBytes: Number(meta.sizeBytes ?? session.sizeBytes),
           status: "ready",
         });
@@ -445,7 +536,12 @@ export default async function uploadRoutes(app: FastifyInstance) {
         "Upload finalized"
       );
 
-      return reply.code(200).send(result);
+      return reply.code(200).send({
+        fileId: result.fileId,
+        ...(exposeBlobId ? { blobId: result.blobId } : {}),
+        sizeBytes: result.sizeBytes,
+        status: result.status,
+      });
     } catch (err: any) {
       if (err?.message === "UPLOAD_FINALIZATION_IN_PROGRESS") {
         return sendApiError(
@@ -475,6 +571,22 @@ export default async function uploadRoutes(app: FastifyInstance) {
   app.delete("/v1/uploads/:uploadId", async (req, reply) => {
     const log = req.log;
     const { uploadId } = req.params as { uploadId: string };
+    const cancelLimit = await checkTieredRateLimit({
+      req,
+      scope: "upload_control",
+    });
+    if (!cancelLimit.allowed) {
+      return sendApiError(reply, 429, "RATE_LIMITED", "Rate limit exceeded", {
+        retryable: true,
+        details: {
+          limit: cancelLimit.limit,
+          current: cancelLimit.current,
+          windowSeconds: cancelLimit.windowSeconds,
+          authenticated: cancelLimit.identity.authenticated,
+          authMethod: cancelLimit.identity.method,
+        },
+      });
+    }
 
     if (!isUuid(uploadId)) {
       return sendApiError(reply, 400, "INVALID_UPLOAD_ID", "uploadId must be a UUID");
@@ -538,6 +650,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
         .multi()
         .del(uploadKeys.session(uploadId))
         .del(uploadKeys.chunks(uploadId))
+        .srem(uploadKeys.gcIndex(), uploadId)
         .exec();
 
       log.info({ uploadId }, "Upload canceled");
