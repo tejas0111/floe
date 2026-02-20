@@ -391,13 +391,6 @@ export async function filesRoutes(app: FastifyInstance) {
       reply.header("Accept-Ranges", "bytes");
       reply.header("ETag", blobId);
 
-      // HEAD requests can be satisfied from metadata.
-      if (req.method === "HEAD") {
-        reply.header("Content-Type", mimeType);
-        reply.header("Content-Length", String(sizeBytes));
-        return reply.status(200).send();
-      }
-
       // Only single-range is supported.
       const rangeHeader = (req.headers as any)?.range as string | undefined;
 
@@ -444,6 +437,11 @@ export async function filesRoutes(app: FastifyInstance) {
 
       if (status === 206) {
         reply.header("Content-Range", `bytes ${start}-${end}/${sizeBytes}`);
+      }
+
+      // HEAD requests are satisfied from metadata but should still reflect range semantics.
+      if (req.method === "HEAD") {
+        return reply.status(status).send();
       }
 
       const stream = Readable.from(
