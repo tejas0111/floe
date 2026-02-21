@@ -8,11 +8,14 @@ import path from "path";
 import { sendApiError } from "../utils/apiError.js";
 import { ChunkConfig, UploadConfig } from "../config/uploads.config.js";
 import { WalrusEpochLimits } from "../config/walrus.config.js";
-import { AuthUploadPolicyConfig } from "../config/auth.config.js";
+import {
+  AuthOwnerPolicyConfig,
+  AuthUploadPolicyConfig,
+} from "../config/auth.config.js";
 
 import { createSession, getSession } from "../services/upload/upload.session.js";
 import { finalizeUpload } from "../services/upload/upload.finalize.js";
-import { checkTieredRateLimit } from "../services/auth/auth.rate-limit.js";
+import { applyRateLimitHeaders } from "../services/auth/auth.headers.js";
 
 import { chunkStore } from "../store/index.js";
 import { getRedis } from "../state/client.js";
@@ -35,6 +38,31 @@ function shouldExposeBlobId(query: any): boolean {
   if (process.env.FLOE_EXPOSE_BLOB_ID === "1") return true;
   const raw = query?.includeBlobId ?? query?.include_blob_id ?? query?.includeStorage;
   return raw === "1" || raw === "true" || raw === true;
+}
+
+const SUI_ADDRESS_RE = /^(0x)?[0-9a-fA-F]{64}$/;
+function parseOptionalSuiAddressEnv(name: string): string | undefined {
+  const raw = process.env[name]?.trim();
+  if (!raw) return undefined;
+  if (!SUI_ADDRESS_RE.test(raw)) {
+    throw new Error(`${name} must be a valid 32-byte Sui address`);
+  }
+  return `0x${raw.replace(/^0x/i, "").toLowerCase()}`;
+}
+
+const DEFAULT_OWNER_ADDRESS = parseOptionalSuiAddressEnv("FLOE_DEFAULT_OWNER_ADDRESS");
+
+function assertOwnerAccess(params: {
+  expectedOwner?: string | null;
+  requestOwner?: string;
+}) {
+  if (!AuthOwnerPolicyConfig.enforceUploadOwner) return;
+  const expected = params.expectedOwner?.trim();
+  if (!expected) return;
+  const provided = params.requestOwner?.trim();
+  if (!provided || provided.toLowerCase() !== expected.toLowerCase()) {
+    throw new Error("OWNER_MISMATCH");
+  }
 }
 
 async function tryReserveUploadCapacity(params: {
@@ -67,10 +95,11 @@ export default async function uploadRoutes(app: FastifyInstance) {
   app.post("/v1/uploads/create", async (req, reply) => {
     const log = req.log;
     const body = req.body as any;
-    const createLimit = await checkTieredRateLimit({
+    const createLimit = await req.server.authProvider.checkRateLimit({
       req,
       scope: "upload_control",
     });
+    applyRateLimitHeaders(reply, createLimit);
     if (!createLimit.allowed) {
       return sendApiError(reply, 429, "RATE_LIMITED", "Rate limit exceeded", {
         retryable: true,
@@ -209,7 +238,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
         uploadId,
         filename,
         contentType,
-        owner: createLimit.identity.owner,
+        owner: createLimit.identity.owner ?? DEFAULT_OWNER_ADDRESS,
         sizeBytes: fileSizeNum,
         chunkSize: resolvedChunkSize,
         totalChunks,
@@ -255,10 +284,11 @@ export default async function uploadRoutes(app: FastifyInstance) {
   app.put("/v1/uploads/:uploadId/chunk/:index", async (req, reply) => {
     const log = req.log;
     const { uploadId, index } = req.params as any;
-    const chunkLimit = await checkTieredRateLimit({
+    const chunkLimit = await req.server.authProvider.checkRateLimit({
       req,
       scope: "upload_chunk",
     });
+    applyRateLimitHeaders(reply, chunkLimit);
     if (!chunkLimit.allowed) {
       return sendApiError(reply, 429, "RATE_LIMITED", "Rate limit exceeded", {
         retryable: true,
@@ -279,6 +309,14 @@ export default async function uploadRoutes(app: FastifyInstance) {
     const session = await getSession(uploadId);
     if (!session) {
       return sendApiError(reply, 404, "UPLOAD_NOT_FOUND", "Invalid uploadId");
+    }
+    try {
+      assertOwnerAccess({
+        expectedOwner: session.owner,
+        requestOwner: chunkLimit.identity.owner,
+      });
+    } catch {
+      return sendApiError(reply, 403, "OWNER_MISMATCH", "Upload owner mismatch");
     }
 
     if (session.status === "completed") {
@@ -371,10 +409,11 @@ export default async function uploadRoutes(app: FastifyInstance) {
   app.get("/v1/uploads/:uploadId/status", async (req, reply) => {
     const { uploadId } = req.params as { uploadId: string };
     const exposeBlobId = shouldExposeBlobId((req as any).query);
-    const statusLimit = await checkTieredRateLimit({
+    const statusLimit = await req.server.authProvider.checkRateLimit({
       req,
       scope: "upload_control",
     });
+    applyRateLimitHeaders(reply, statusLimit);
     if (!statusLimit.allowed) {
       return sendApiError(reply, 429, "RATE_LIMITED", "Rate limit exceeded", {
         retryable: true,
@@ -398,33 +437,54 @@ export default async function uploadRoutes(app: FastifyInstance) {
       redis.hgetall<Record<string, string>>(uploadKeys.meta(uploadId)),
       redis.smembers(uploadKeys.chunks(uploadId)),
     ]);
+    const receivedChunks = members.map(Number).sort((a, b) => a - b);
 
     if (!session) {
       const status = meta?.status;
       if (!status) {
         return sendApiError(reply, 404, "UPLOAD_NOT_FOUND", "Invalid uploadId");
       }
+      try {
+        assertOwnerAccess({
+          expectedOwner: meta?.owner,
+          requestOwner: statusLimit.identity.owner,
+        });
+      } catch {
+        return sendApiError(reply, 403, "OWNER_MISMATCH", "Upload owner mismatch");
+      }
 
       return {
         uploadId,
         chunkSize: meta?.chunkSize ? Number(meta.chunkSize) : null,
         totalChunks: meta?.totalChunks ? Number(meta.totalChunks) : null,
-        receivedChunks: members.map(Number).sort((a, b) => a - b),
+        receivedChunks,
+        receivedChunkCount: receivedChunks.length,
         expiresAt: meta?.expiresAt ? Number(meta.expiresAt) : null,
         status,
         ...(meta?.fileId ? { fileId: meta.fileId } : {}),
         ...(exposeBlobId && meta?.blobId ? { blobId: meta.blobId } : {}),
+        ...(meta?.walrusEndEpoch ? { walrusEndEpoch: Number(meta.walrusEndEpoch) } : {}),
         ...(meta?.error ? { error: meta.error } : {}),
       };
+    }
+    try {
+      assertOwnerAccess({
+        expectedOwner: session.owner,
+        requestOwner: statusLimit.identity.owner,
+      });
+    } catch {
+      return sendApiError(reply, 403, "OWNER_MISMATCH", "Upload owner mismatch");
     }
 
     return {
       uploadId,
       chunkSize: session.chunkSize,
       totalChunks: session.totalChunks,
-      receivedChunks: members.map(Number).sort((a, b) => a - b),
+      receivedChunks,
+      receivedChunkCount: receivedChunks.length,
       expiresAt: session.expiresAt,
       status: session.status,
+      ...(meta?.walrusEndEpoch ? { walrusEndEpoch: Number(meta.walrusEndEpoch) } : {}),
     };
   });
 
@@ -432,10 +492,11 @@ export default async function uploadRoutes(app: FastifyInstance) {
     const log = req.log;
     const { uploadId } = req.params as { uploadId: string };
     const exposeBlobId = shouldExposeBlobId((req as any).query);
-    const completeLimit = await checkTieredRateLimit({
+    const completeLimit = await req.server.authProvider.checkRateLimit({
       req,
       scope: "upload_control",
     });
+    applyRateLimitHeaders(reply, completeLimit);
     if (!completeLimit.allowed) {
       return sendApiError(reply, 429, "RATE_LIMITED", "Rate limit exceeded", {
         retryable: true,
@@ -459,6 +520,14 @@ export default async function uploadRoutes(app: FastifyInstance) {
       getSession(uploadId),
       redis.hgetall<Record<string, string>>(metaKey),
     ]);
+    try {
+      assertOwnerAccess({
+        expectedOwner: session?.owner ?? meta?.owner,
+        requestOwner: completeLimit.identity.owner,
+      });
+    } catch {
+      return sendApiError(reply, 403, "OWNER_MISMATCH", "Upload owner mismatch");
+    }
 
     const metaStatus = meta?.status;
 
@@ -478,6 +547,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
           ...(exposeBlobId ? { blobId: meta.blobId } : {}),
           sizeBytes: Number(meta.sizeBytes ?? 0),
           status: "ready",
+          ...(meta?.walrusEndEpoch ? { walrusEndEpoch: Number(meta.walrusEndEpoch) } : {}),
         });
       }
 
@@ -501,6 +571,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
           ...(exposeBlobId ? { blobId: meta.blobId } : {}),
           sizeBytes: Number(meta.sizeBytes ?? session.sizeBytes),
           status: "ready",
+          ...(meta?.walrusEndEpoch ? { walrusEndEpoch: Number(meta.walrusEndEpoch) } : {}),
         });
       }
 
@@ -531,7 +602,6 @@ export default async function uploadRoutes(app: FastifyInstance) {
         {
           uploadId,
           fileId: result.fileId,
-          blobId: result.blobId,
         },
         "Upload finalized"
       );
@@ -541,6 +611,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
         ...(exposeBlobId ? { blobId: result.blobId } : {}),
         sizeBytes: result.sizeBytes,
         status: result.status,
+        ...(result.walrusEndEpoch !== undefined ? { walrusEndEpoch: result.walrusEndEpoch } : {}),
       });
     } catch (err: any) {
       if (err?.message === "UPLOAD_FINALIZATION_IN_PROGRESS") {
@@ -571,10 +642,11 @@ export default async function uploadRoutes(app: FastifyInstance) {
   app.delete("/v1/uploads/:uploadId", async (req, reply) => {
     const log = req.log;
     const { uploadId } = req.params as { uploadId: string };
-    const cancelLimit = await checkTieredRateLimit({
+    const cancelLimit = await req.server.authProvider.checkRateLimit({
       req,
       scope: "upload_control",
     });
+    applyRateLimitHeaders(reply, cancelLimit);
     if (!cancelLimit.allowed) {
       return sendApiError(reply, 429, "RATE_LIMITED", "Rate limit exceeded", {
         retryable: true,
@@ -601,6 +673,14 @@ export default async function uploadRoutes(app: FastifyInstance) {
       redis.hgetall<Record<string, string>>(metaKey),
       redis.exists(lockKey),
     ]);
+    try {
+      assertOwnerAccess({
+        expectedOwner: session?.owner ?? meta?.owner,
+        requestOwner: cancelLimit.identity.owner,
+      });
+    } catch {
+      return sendApiError(reply, 403, "OWNER_MISMATCH", "Upload owner mismatch");
+    }
 
     if (hasLock) {
       return sendApiError(

@@ -20,6 +20,19 @@ const WALRUS_PUBLISHER_URL = (() => {
   return url.replace(/\/$/, "");
 })();
 
+const SUI_ADDRESS_RE = /^(0x)?[0-9a-fA-F]{64}$/;
+
+function parseOptionalSuiAddressEnv(name: string): string | undefined {
+  const raw = process.env[name]?.trim();
+  if (!raw) return undefined;
+  if (!SUI_ADDRESS_RE.test(raw)) {
+    throw new Error(`${name} must be a valid 32-byte Sui address`);
+  }
+  return `0x${raw.replace(/^0x/i, "").toLowerCase()}`;
+}
+
+const WALRUS_SEND_OBJECT_TO = parseOptionalSuiAddressEnv("WALRUS_SEND_OBJECT_TO");
+
 if (IS_MAINNET && /testnet/i.test(WALRUS_PUBLISHER_URL)) {
   console.warn(
     "WALRUS_PUBLISHER_URL looks like testnet but FLOE_NETWORK=mainnet; verify your env"
@@ -76,6 +89,9 @@ export async function uploadToWalrusOnce(
   }
 
   const params = new URLSearchParams({ epochs: String(epochs) });
+  if (WALRUS_SEND_OBJECT_TO) {
+    params.set("send_object_to", WALRUS_SEND_OBJECT_TO);
+  }
   const headers: Record<string, string> = {
     "Content-Type": "application/octet-stream",
   };

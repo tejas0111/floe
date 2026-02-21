@@ -2,8 +2,7 @@
 
 import fs from "fs/promises";
 import path from "path";
-import { createWriteStream, createReadStream } from "fs";
-import { once } from "events";
+import { Readable } from "stream";
 import crypto from "crypto";
 
 import { UploadConfig } from "../../config/uploads.config.js";
@@ -55,33 +54,19 @@ async function releaseFinalizeLockAtomic(params: {
   return Number(res) === 1;
 }
 
-async function assembleChunksToFile(params: {
+function createChunkAssemblyStream(params: {
   uploadId: string;
   totalChunks: number;
-  outPath: string;
-}) {
-  const ws = createWriteStream(params.outPath, { flags: "w" });
-  const finished = once(ws, "finish");
-  const failed = once(ws, "error").then(([err]) => {
-    throw err;
-  });
-
-  try {
+}): Readable {
+  const iter = async function* () {
     for (let i = 0; i < params.totalChunks; i++) {
       const rs = chunkStore.openChunk(params.uploadId, i);
       for await (const buf of rs) {
-        if (!ws.write(buf)) {
-          await once(ws, "drain");
-        }
+        yield buf as Uint8Array;
       }
     }
-
-    ws.end();
-    await Promise.race([finished, failed]);
-  } catch (err) {
-    ws.destroy();
-    throw err;
-  }
+  };
+  return Readable.from(iter());
 }
 
 export async function finalizeUpload(session: InternalSession): Promise<{
@@ -89,6 +74,7 @@ export async function finalizeUpload(session: InternalSession): Promise<{
   blobId: string;
   sizeBytes: number;
   status: "ready";
+  walrusEndEpoch?: number;
 }> {
   const redis = getRedis();
   const uploadId = session.uploadId;
@@ -106,6 +92,7 @@ export async function finalizeUpload(session: InternalSession): Promise<{
       blobId: pre.blobId,
       sizeBytes: Number(pre.sizeBytes ?? session.sizeBytes),
       status: "ready",
+      ...(pre.walrusEndEpoch ? { walrusEndEpoch: Number(pre.walrusEndEpoch) } : {}),
     };
   }
 
@@ -156,6 +143,7 @@ export async function finalizeUpload(session: InternalSession): Promise<{
         blobId: meta.blobId,
         sizeBytes: Number(meta.sizeBytes ?? session.sizeBytes),
         status: "ready",
+        ...(meta.walrusEndEpoch ? { walrusEndEpoch: Number(meta.walrusEndEpoch) } : {}),
       };
     }
 
@@ -177,32 +165,30 @@ export async function finalizeUpload(session: InternalSession): Promise<{
       }
     }
 
-    const outPath = finalFilePath(uploadId);
-
     // Checkpointed fields (best-effort).
     let blobId: string | null = meta?.blobId ?? null;
     let fileId: string | null = meta?.fileId ?? null;
+    let walrusEndEpoch: number | undefined =
+      meta?.walrusEndEpoch !== undefined ? Number(meta.walrusEndEpoch) : undefined;
 
     // Only assemble/upload if we don't already have a durable blobId checkpoint.
     if (!blobId) {
-      assertFinalizeLockHealthy();
-      await refreshFinalizeLock();
-      await assembleChunksToFile({
-        uploadId,
-        totalChunks: session.totalChunks,
-        outPath,
-      });
-
       assertFinalizeLockHealthy();
       await refreshFinalizeLock();
       const result = await uploadToWalrusWithMetrics({
         uploadId,
         sizeBytes: session.sizeBytes,
         epochs: session.resolvedEpochs,
-        streamFactory: () => createReadStream(outPath),
+        // Re-creatable stream for Walrus retries without creating a duplicate .bin file.
+        streamFactory: () =>
+          createChunkAssemblyStream({
+            uploadId,
+            totalChunks: session.totalChunks,
+          }),
       });
 
       blobId = result.blobId;
+      walrusEndEpoch = result.endEpoch;
 
       if (!blobId) {
         throw new Error("WALRUS_UPLOAD_FAILED");
@@ -212,6 +198,7 @@ export async function finalizeUpload(session: InternalSession): Promise<{
       await redis.hset(metaKey, {
         blobId,
         walrusUploadedAt: String(Date.now()),
+        ...(walrusEndEpoch !== undefined ? { walrusEndEpoch: String(walrusEndEpoch) } : {}),
       });
     }
 
@@ -223,6 +210,7 @@ export async function finalizeUpload(session: InternalSession): Promise<{
         sizeBytes: session.sizeBytes,
         mimeType: session.contentType ?? "application/octet-stream",
         owner: session.owner,
+        walrusEndEpoch,
       });
 
       fileId = minted.fileId;
@@ -237,6 +225,7 @@ export async function finalizeUpload(session: InternalSession): Promise<{
             mime: session.contentType ?? "application/octet-stream",
             created_at: Date.now(),
             owner: session.owner ?? null,
+            walrus_end_epoch: walrusEndEpoch ?? null,
           }),
           {
             px: Number(process.env.FLOE_FILE_FIELDS_CACHE_TTL_MS ?? 24 * 60 * 60_000),
@@ -254,7 +243,9 @@ export async function finalizeUpload(session: InternalSession): Promise<{
     assertFinalizeLockHealthy();
     await refreshFinalizeLock();
     await chunkStore.cleanup(uploadId);
-    await fs.unlink(outPath).catch(() => {});
+    await fs
+      .unlink(finalFilePath(uploadId))
+      .catch(() => {});
 
     assertFinalizeLockHealthy();
     await refreshFinalizeLock();
@@ -266,6 +257,7 @@ export async function finalizeUpload(session: InternalSession): Promise<{
         blobId,
         sizeBytes: String(session.sizeBytes),
         completedAt: String(Date.now()),
+        ...(walrusEndEpoch !== undefined ? { walrusEndEpoch: String(walrusEndEpoch) } : {}),
       })
       .del(uploadKeys.session(uploadId))
       .del(uploadKeys.chunks(uploadId))
@@ -281,6 +273,7 @@ export async function finalizeUpload(session: InternalSession): Promise<{
       blobId,
       sizeBytes: session.sizeBytes,
       status: "ready",
+      ...(walrusEndEpoch !== undefined ? { walrusEndEpoch } : {}),
     };
   } catch (err) {
     const message = (err as Error).message;

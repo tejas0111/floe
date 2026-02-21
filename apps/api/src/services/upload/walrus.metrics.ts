@@ -51,7 +51,6 @@ export async function uploadToWalrusWithMetrics(params: {
             durationMs: Date.now() - start,
             outcome: "success",
             walrusCost: res.cost,
-            walrusObjectId: res.objectId,
             walrusEndEpoch: res.endEpoch,
             network: process.env.FLOE_NETWORK as any,
             timestamp: Date.now(),
