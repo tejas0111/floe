@@ -17,6 +17,10 @@ const LIMIT_DEFAULTS = {
     public: 30,
     authenticated: 1200,
   },
+  file_read: {
+    public: 120,
+    authenticated: 1200,
+  },
 } as const;
 
 const LIMIT_ENV = {
@@ -27,6 +31,10 @@ const LIMIT_ENV = {
   upload_chunk: {
     public: "FLOE_RATE_LIMIT_UPLOAD_CHUNK_PUBLIC",
     authenticated: "FLOE_RATE_LIMIT_UPLOAD_CHUNK_AUTH",
+  },
+  file_read: {
+    public: "FLOE_RATE_LIMIT_FILE_READ_PUBLIC",
+    authenticated: "FLOE_RATE_LIMIT_FILE_READ_AUTH",
   },
 } as const;
 
@@ -52,20 +60,55 @@ function buildLimits() {
   return limits;
 }
 
+function parseBoolEnv(name: string, fallback: boolean): boolean {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  if (raw === "1" || raw.toLowerCase() === "true") return true;
+  if (raw === "0" || raw.toLowerCase() === "false") return false;
+  throw new Error(`${name} must be one of: 1, 0, true, false`);
+}
+
+function assertTierOrder(limits: Record<RateLimitScope, Record<RateLimitTier, number>>) {
+  for (const scope of Object.keys(limits) as RateLimitScope[]) {
+    const pub = limits[scope].public;
+    const auth = limits[scope].authenticated;
+    if (auth < pub) {
+      throw new Error(
+        `Invalid rate limit config for ${scope}: authenticated (${auth}) must be >= public (${pub})`
+      );
+    }
+  }
+}
+
+const builtLimits = buildLimits();
+assertTierOrder(builtLimits);
+
+const maxFileSizeBytes = {
+  public: parsePositiveIntEnv(
+    "FLOE_PUBLIC_MAX_FILE_SIZE_BYTES",
+    100 * 1024 * 1024
+  ),
+  authenticated: parsePositiveIntEnv(
+    "FLOE_AUTH_MAX_FILE_SIZE_BYTES",
+    15 * 1024 * 1024 * 1024
+  ),
+} as const;
+
+if (maxFileSizeBytes.authenticated < maxFileSizeBytes.public) {
+  throw new Error(
+    `Invalid upload policy: FLOE_AUTH_MAX_FILE_SIZE_BYTES (${maxFileSizeBytes.authenticated}) must be >= FLOE_PUBLIC_MAX_FILE_SIZE_BYTES (${maxFileSizeBytes.public})`
+  );
+}
+
 export const AuthRateLimitConfig = {
   windowSeconds: parsePositiveIntEnv("FLOE_RATE_LIMIT_WINDOW_SECONDS", 60),
-  limits: buildLimits(),
+  limits: builtLimits,
 } as const;
 
 export const AuthUploadPolicyConfig = {
-  maxFileSizeBytes: {
-    public: parsePositiveIntEnv(
-      "FLOE_PUBLIC_MAX_FILE_SIZE_BYTES",
-      100 * 1024 * 1024
-    ),
-    authenticated: parsePositiveIntEnv(
-      "FLOE_AUTH_MAX_FILE_SIZE_BYTES",
-      15 * 1024 * 1024 * 1024
-    ),
-  },
+  maxFileSizeBytes,
+} as const;
+
+export const AuthOwnerPolicyConfig = {
+  enforceUploadOwner: parseBoolEnv("FLOE_ENFORCE_UPLOAD_OWNER", false),
 } as const;

@@ -1,146 +1,117 @@
 # Floe
 
-Developer-first video ingestion for Walrus: resumable chunked uploads, server-side state tracking, and a stable on-chain `fileId` for each uploaded asset.
+Floe is a developer-first video ingestion backend for Walrus.
 
-## Features (v1)
-- Resumable uploads with unordered, parallel chunk transfer
-- Per-chunk integrity verification via `x-chunk-sha256`
-- Redis-backed session state with crash-safe reconciliation
-- Finalization publishes to Walrus and mints an on-chain `fileId` (permanent identifier)
-- Cancel endpoint and garbage collection for incomplete uploads
-- Stable asset model:
-  - `GET /v1/files/:fileId/metadata` (summary)
-  - `GET /v1/files/:fileId/manifest` (read-path layout contract)
-  - Walrus `blobId` is hidden by default; include with `?includeBlobId=1` for debugging
+It provides resumable chunk uploads, integrity verification, crash-safe session state, and finalization to a stable on-chain `fileId`.
+
+## What Floe Solves
+
+- Large uploads over unstable networks
+- Safe resume after client or server interruption
+- Deterministic upload lifecycle with explicit status
+- Reliable finalize flow with lock + retry behavior
+- Stable read model (`fileId`) decoupled from storage internals
+
+## Core Capabilities
+
+- Chunked upload sessions (`/v1/uploads/*`)
+- Unordered chunk uploads with `x-chunk-sha256` validation
+- Session + metadata persistence in Redis
+- Temporary chunk persistence on disk with GC cleanup
+- Finalization to Walrus + on-chain metadata write to Sui
+- File read endpoints (`/v1/files/:fileId/*`) including byte-range stream
+- Tiered request limits (public vs authenticated request context)
 
 ## Architecture
-Floe separates the control plane from the data plane:
-- Control plane: upload sessions, status, and asset identifiers (`fileId`)
-- Data plane: chunk persistence, assembly, and Walrus publishing
 
-Storage:
-- Chunks are written to disk first (crash-safe)
-- Redis tracks upload state and metadata
-- Final blobs are published to Walrus
+High-level flow:
 
-Lifecycle:
-```
-Create session -> Upload chunks -> Verify completion -> Finalize to Walrus
-```
+1. Client creates an upload session.
+2. Client uploads chunks in any order.
+3. Floe validates hashes and tracks progress.
+4. Client requests complete.
+5. Floe assembles + uploads to Walrus and writes `FileMeta` on Sui.
+6. Clients read through `/v1/files/:fileId/metadata|manifest|stream`.
 
-```
-src/
-├── routes/          API endpoints
-├── services/        Upload lifecycle + Walrus integration
-├── store/           Chunk persistence + metadata
-├── state/           Redis client + GC workers
-└── config/          Runtime settings
-```
+Runtime components:
 
-This layout reflects current responsibilities and may evolve as streaming and SDK layers are introduced.
+- **API**: Fastify routes + upload orchestration
+- **Redis**: session state, chunk index, locks, capacity/rate keys
+- **Disk**: temporary chunk files and assembly output
+- **Walrus**: blob storage publish/read path
+- **Sui**: stable file metadata object (maps to `fileId`)
 
-**Key pieces:**
+## Local Development
 
-`upload.session.ts` – Creates and tracks upload sessions  
-`upload.finalize.ts` – Assembles chunks and publishes to Walrus  
-`walrus.upload.ts` – Retry logic and blob publishing  
-`upload.gc.worker.ts` – Cleans up expired/failed uploads 
+### Requirements
 
-## Running Locally
+- Node.js `>=20`
+- Upstash Redis credentials
+- Sui key + RPC access
+- Walrus publisher + aggregator endpoints
 
-**Requirements:**
-- Node.js 20+
-- Redis
-- Access to a Walrus node
+### Setup
 
-**Setup:**
 ```bash
 git clone https://github.com/tejas0111/floe.git
-cd floe && npm install
+cd floe
+npm install
 cp .env.example .env
-# Edit .env with your Walrus endpoint
+```
 
+Set required environment values in `.env`.
+
+Minimal required `.env`:
+
+```dotenv
+PORT=3001
+NODE_ENV=development
+UPLOAD_TMP_DIR=/home/tejas/Floe/apps/api/tmp/upload/
+UPSTASH_REDIS_REST_URL=https://<your-upstash-url>.upstash.io
+UPSTASH_REDIS_REST_TOKEN=<your-upstash-token>
+WALRUS_PUBLISHER_URL=https://publisher.walrus-testnet.walrus.space
+WALRUS_AGGREGATOR_URL=https://aggregator.suicore.com
+FLOE_NETWORK=testnet
+SUI_PRIVATE_KEY=suiprivkey...
+SUI_PACKAGE_ID=0x<your-package-id>
+```
+
+All optional tuning values are listed in `.env.example`.
+
+### Run
+
+```bash
 npm run dev
-# or
-npm run build && npm run start
 ```
 
-**Upload a file:**
-```bash
-# Default API base is http://localhost:3001/v1/uploads
-# If your API runs on a different port, use --api or set FLOE_API_BASE.
-./floe-upload.sh "path/to/video.mp4" --chunk 2 --epochs 3 --parallel 3
-```
-
-The CLI:
-- creates an upload session
-- splits the file into server-approved chunk sizes (max 20MB per chunk)
-- uploads chunks in parallel (unordered)
-- finalizes into a Walrus blob
-- mints an on-chain `fileId` (permanent object ID)
-
-On success it prints the `fileId` and a metadata URL:
-- `GET /v1/files/<fileId>/metadata`
-
-If the upload is interrupted, you can resume without re-uploading completed chunks:
+### Build
 
 ```bash
-# Auto-resume if a state file exists: <file>.floe-upload.json
-./floe-upload.sh "path/to/video.mp4" --parallel 3
-
-# Or explicitly resume by uploadId
-./floe-upload.sh "path/to/video.mp4" --resume <uploadId> --parallel 3
+npm run build
+npm run start
 ```
 
-**CLI settings:**
-- `--api <url>` overrides the API base (example: `http://localhost:3000/v1/uploads`)
-- `FLOE_API_BASE` can be used instead of `--api`
-- Curl tuning:
-  - `FLOE_CURL_CONNECT_TIMEOUT_S` (default: 5)
-  - `FLOE_CURL_MAX_TIME_S` (default: 240)
-  - `FLOE_CURL_RETRY` (default: 3)
-  - `FLOE_CURL_RETRY_DELAY_S` (default: 1)
+## Upload CLI
 
-## API reference
+Use the bundled uploader:
 
-Floe v1 exposes an ingestion control plane and a stable asset model. It also
-includes a minimal read endpoint (`/stream`) designed for HTTP byte-range reads.
-Treat read-path support as beta: correct semantics first, performance tuning later.
-
-Simple REST endpoints:
-
-```
-POST   /v1/uploads/create           # Start new upload session
-PUT    /v1/uploads/:id/chunk/:n     # Upload chunk n
-GET    /v1/uploads/:id/status       # Check upload progress
-POST   /v1/uploads/:id/complete     # Finalize to Walrus
-DELETE /v1/uploads/:id              # Cancel upload
-
-GET    /v1/files/:fileId/metadata   # Asset metadata (stable fields)
-GET    /v1/files/:fileId/manifest   # Asset layout manifest (read-path contract)
-GET    /v1/files/:fileId/stream     # Read bytes (supports HTTP Range)
-HEAD   /v1/files/:fileId/stream     # Content headers for playback clients
+```bash
+./floe-upload.sh "path/to/video.mp4" --parallel 3 --epochs 3
 ```
 
-Each chunk upload includes an `x-chunk-sha256` header for integrity verification.
-By default, Floe does not expose the underlying Walrus `blobId` in file
-responses. To include it for debugging, pass `?includeBlobId=1`.
+Supports resume and API override:
 
-## Default Limits (v1)
-These defaults are intended to prevent accidental DoS when exposed publicly:
-- Max chunk size: 20 MiB
-- Max file size: 15 GiB
-- Max total chunks per upload: 200,000
-- Max active uploads admitted: 100
+```bash
+./floe-upload.sh "path/to/video.mp4" --resume <uploadId>
+./floe-upload.sh "path/to/video.mp4" --api http://localhost:3001/v1/uploads
+```
 
-## Roadmap
-- Playback/read endpoints (HTTP Range) built on top of `manifest`
-- Developer SDK
-- Optional access control (signed URLs) for playback endpoints
-- Operational packaging (Docker/K8s) and metrics
+## Documentation
 
-## Contributing
-Issues and pull requests are welcome. Please open a discussion for large changes so the API and storage model stay consistent.
+- `docs/API.md` – endpoints, request/response behavior, limits
+- `docs/OPERATIONS.md` – runtime model, GC, limits, failure handling
+- `docs/SECURITY.md` – current auth model and production hardening path
 
 ## License
-MIT
+
+MIT (`LICENSE`)

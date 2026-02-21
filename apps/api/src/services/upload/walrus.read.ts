@@ -125,6 +125,16 @@ export async function fetchWalrusBlob(params: {
       try {
         const res = await fetchWithTimeout({ url, headers, signal: params.signal });
 
+        // Some aggregators can be out-of-sync or on a different network.
+        // Try other aggregators before concluding the blob is missing.
+        if (res.status === 404) {
+          lastStatus = res.status;
+          try {
+            await res.body?.cancel();
+          } catch {}
+          break;
+        }
+
         if (isRetryableStatus(res.status)) {
           lastStatus = res.status;
           try {

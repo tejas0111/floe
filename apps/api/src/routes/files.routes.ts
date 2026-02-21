@@ -8,6 +8,8 @@ import { getRedis } from "../state/client.js";
 import { fileKeys } from "../state/keys.js";
 import { fetchWalrusBlob } from "../services/upload/walrus.read.js";
 import { WalrusReadLimits } from "../config/walrus.config.js";
+import { sendApiError } from "../utils/apiError.js";
+import { applyRateLimitHeaders } from "../services/auth/auth.headers.js";
 
 function inferContainerFromMime(mimeType: string): string | null {
   const m = (mimeType ?? "").toLowerCase();
@@ -37,7 +39,29 @@ type NormalizedFileFields = {
   mimeType: string;
   createdAt: number;
   owner: unknown;
+  walrusEndEpoch: number | null;
 };
+
+function parseOptionalU64(raw: unknown): number | null {
+  if (raw === null || raw === undefined) return null;
+
+  if (typeof raw === "number" && Number.isFinite(raw) && raw >= 0) {
+    return Math.floor(raw);
+  }
+  if (typeof raw === "string" && raw.trim() !== "") {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 0) return Math.floor(n);
+  }
+  if (typeof raw === "object") {
+    const vec = (raw as any)?.vec;
+    if (Array.isArray(vec)) {
+      if (vec.length === 0) return null;
+      return parseOptionalU64(vec[0]);
+    }
+  }
+
+  return null;
+}
 
 function normalizeFileFields(fields: any): NormalizedFileFields | null {
   if (!fields || typeof fields !== "object") return null;
@@ -62,6 +86,7 @@ function normalizeFileFields(fields: any): NormalizedFileFields | null {
     mimeType,
     createdAt: rawCreatedAt,
     owner: fields.owner ?? null,
+    walrusEndEpoch: parseOptionalU64(fields.walrus_end_epoch),
   };
 }
 
@@ -159,14 +184,24 @@ async function* walrusByteStream(params: {
   maxSegmentBytes: number;
   signal: AbortSignal;
 }): AsyncGenerator<Uint8Array> {
+  const safeUpstreamSnippet = (body: string): string => {
+    const trimmed = (body ?? "").trim();
+    if (!trimmed) return "";
+    const snippet = trimmed.slice(0, 160);
+    // Keep only readable ASCII to avoid binary log spam.
+    const ascii = snippet.replace(/[^\x20-\x7E]/g, "");
+    return ascii;
+  };
+
   const makeWalrusReadError = (upstreamStatus: number, upstreamBody: string) => {
+    const snippet = safeUpstreamSnippet(upstreamBody);
     const err = new Error(
-      `WALRUS_RANGE_FAILED status=${upstreamStatus} ${upstreamBody || ""}`.trim()
+      `WALRUS_RANGE_FAILED status=${upstreamStatus}${snippet ? ` body=${snippet}` : ""}`.trim()
     ) as Error & { statusCode?: number };
 
     if (upstreamStatus === 404) {
       err.statusCode = 404;
-      err.message = "FILE_CONTENT_NOT_FOUND";
+      err.message = "FILE_BLOB_UNAVAILABLE";
       return err;
     }
 
@@ -259,6 +294,17 @@ async function* walrusByteStream(params: {
 
 export async function filesRoutes(app: FastifyInstance) {
   app.get("/v1/files/:fileId/metadata", async (req, res) => {
+    const readLimit = await req.server.authProvider.checkRateLimit({
+      req,
+      scope: "file_read",
+    });
+    applyRateLimitHeaders(res, readLimit);
+    if (!readLimit.allowed) {
+      return sendApiError(res, 429, "RATE_LIMITED", "Rate limit exceeded", {
+        retryable: true,
+      });
+    }
+
     const { fileId } = req.params as { fileId: string };
 
     let fields: any | null = null;
@@ -266,23 +312,28 @@ export async function filesRoutes(app: FastifyInstance) {
       fields = await getFileFieldsCached(fileId);
     } catch (err) {
       req.log.error({ err, fileId }, "Sui read failed");
-      return res.status(503).send({
-        error: "SUI_UNAVAILABLE",
-        message: "Failed to fetch file metadata from Sui",
-      });
+      return sendApiError(
+        res,
+        503,
+        "SUI_UNAVAILABLE",
+        "Failed to fetch file metadata from Sui",
+        { retryable: true }
+      );
     }
 
     if (!fields) {
-      return res.status(404).send({ error: "FILE_NOT_FOUND" });
+      return sendApiError(res, 404, "FILE_NOT_FOUND", "File not found");
     }
 
     const normalized = normalizeFileFields(fields);
     if (!normalized) {
       req.log.error({ fileId, fields }, "Invalid file metadata fields");
-      return res.status(502).send({
-        error: "INVALID_FILE_METADATA",
-        message: "File metadata is invalid",
-      });
+      return sendApiError(
+        res,
+        502,
+        "INVALID_FILE_METADATA",
+        "File metadata is invalid"
+      );
     }
 
     const exposeBlobId = shouldExposeBlobId(req);
@@ -297,10 +348,22 @@ export async function filesRoutes(app: FastifyInstance) {
       mimeType: normalized.mimeType,
       owner: normalized.owner,
       createdAt: normalized.createdAt,
+      ...(normalized.walrusEndEpoch !== null ? { walrusEndEpoch: normalized.walrusEndEpoch } : {}),
     };
   });
 
   app.get("/v1/files/:fileId/manifest", async (req, res) => {
+    const readLimit = await req.server.authProvider.checkRateLimit({
+      req,
+      scope: "file_read",
+    });
+    applyRateLimitHeaders(res, readLimit);
+    if (!readLimit.allowed) {
+      return sendApiError(res, 429, "RATE_LIMITED", "Rate limit exceeded", {
+        retryable: true,
+      });
+    }
+
     const { fileId } = req.params as { fileId: string };
 
     let fields: any | null = null;
@@ -308,23 +371,28 @@ export async function filesRoutes(app: FastifyInstance) {
       fields = await getFileFieldsCached(fileId);
     } catch (err) {
       req.log.error({ err, fileId }, "Sui read failed");
-      return res.status(503).send({
-        error: "SUI_UNAVAILABLE",
-        message: "Failed to fetch file metadata from Sui",
-      });
+      return sendApiError(
+        res,
+        503,
+        "SUI_UNAVAILABLE",
+        "Failed to fetch file metadata from Sui",
+        { retryable: true }
+      );
     }
 
     if (!fields) {
-      return res.status(404).send({ error: "FILE_NOT_FOUND" });
+      return sendApiError(res, 404, "FILE_NOT_FOUND", "File not found");
     }
 
     const normalized = normalizeFileFields(fields);
     if (!normalized) {
       req.log.error({ fileId, fields }, "Invalid file metadata fields");
-      return res.status(502).send({
-        error: "INVALID_FILE_METADATA",
-        message: "File metadata is invalid",
-      });
+      return sendApiError(
+        res,
+        502,
+        "INVALID_FILE_METADATA",
+        "File metadata is invalid"
+      );
     }
 
     const exposeBlobId = shouldExposeBlobId(req);
@@ -337,6 +405,7 @@ export async function filesRoutes(app: FastifyInstance) {
       sizeBytes: normalized.sizeBytes,
       mimeType: normalized.mimeType,
       container,
+      ...(normalized.walrusEndEpoch !== null ? { walrusEndEpoch: normalized.walrusEndEpoch } : {}),
       layout: {
         type: "walrus_single_blob",
         segments: [
@@ -355,6 +424,17 @@ export async function filesRoutes(app: FastifyInstance) {
     method: ["GET", "HEAD"],
     url: "/v1/files/:fileId/stream",
     handler: async (req, reply) => {
+      const readLimit = await req.server.authProvider.checkRateLimit({
+        req,
+        scope: "file_read",
+      });
+      applyRateLimitHeaders(reply, readLimit);
+      if (!readLimit.allowed) {
+        return sendApiError(reply, 429, "RATE_LIMITED", "Rate limit exceeded", {
+          retryable: true,
+        });
+      }
+
       const { fileId } = req.params as { fileId: string };
 
       let fields: any | null = null;
@@ -362,26 +442,28 @@ export async function filesRoutes(app: FastifyInstance) {
         fields = await getFileFieldsCached(fileId);
       } catch (err) {
         req.log.error({ err, fileId }, "Sui read failed");
-        reply.type("application/json");
-        return reply.status(503).send({
-          error: "SUI_UNAVAILABLE",
-          message: "Failed to fetch file metadata from Sui",
-        });
+        return sendApiError(
+          reply,
+          503,
+          "SUI_UNAVAILABLE",
+          "Failed to fetch file metadata from Sui",
+          { retryable: true }
+        );
       }
 
       if (!fields) {
-        reply.type("application/json");
-        return reply.status(404).send({ error: "FILE_NOT_FOUND" });
+        return sendApiError(reply, 404, "FILE_NOT_FOUND", "File not found");
       }
 
       const normalized = normalizeFileFields(fields);
       if (!normalized) {
         req.log.error({ fileId, fields }, "Invalid file metadata fields");
-        reply.type("application/json");
-        return reply.status(502).send({
-          error: "INVALID_FILE_METADATA",
-          message: "File metadata is invalid",
-        });
+        return sendApiError(
+          reply,
+          502,
+          "INVALID_FILE_METADATA",
+          "File metadata is invalid"
+        );
       }
 
       const blobId = normalized.blobId;
@@ -407,12 +489,13 @@ export async function filesRoutes(app: FastifyInstance) {
         });
 
         if ("error" in parsedOrErr) {
-          reply.type("application/json");
           reply.header("Content-Range", `bytes */${sizeBytes}`);
-          return reply.status(416).send({
-            error: "INVALID_RANGE",
-            message: "Unsupported Range header",
-          });
+          return sendApiError(
+            reply,
+            416,
+            "INVALID_RANGE",
+            "Unsupported Range header"
+          );
         }
 
         start = parsedOrErr.range.start;
@@ -458,6 +541,11 @@ export async function filesRoutes(app: FastifyInstance) {
       stream.once("end", detachAbortHooks);
       stream.once("close", detachAbortHooks);
       stream.once("error", detachAbortHooks);
+      stream.once("error", (err: any) => {
+        if (err?.message === "FILE_CONTENT_NOT_FOUND") {
+          err.message = "FILE_BLOB_UNAVAILABLE";
+        }
+      });
 
       return reply.status(status).send(stream);
     },

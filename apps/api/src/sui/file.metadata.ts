@@ -14,6 +14,7 @@ export interface FinalizeFileInput {
   sizeBytes: number;
   mimeType: string;
   owner?: string;
+  walrusEndEpoch?: number;
 }
 
 export interface FinalizeFileResult {
@@ -34,6 +35,9 @@ export async function finalizeFileMetadata(
       input.owner 
         ? tx.pure.option("address", input.owner)
         : tx.pure.option("address", null),
+      input.walrusEndEpoch !== undefined
+        ? tx.pure.option("u64", input.walrusEndEpoch)
+        : tx.pure.option("u64", null),
       tx.object("0x6"),
     ],
   });

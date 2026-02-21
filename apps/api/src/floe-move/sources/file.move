@@ -12,6 +12,7 @@ module floe::file {
         size_bytes: u64,
         mime: String,
         owner: Option<address>,
+        walrus_end_epoch: Option<u64>,
         created_at: u64,
     }
     
@@ -20,6 +21,7 @@ module floe::file {
         size_bytes: u64,
         mime: String,
         owner: Option<address>,
+        walrus_end_epoch: Option<u64>,
         clock: &Clock,
         ctx: &mut TxContext
     ) {
@@ -29,6 +31,7 @@ module floe::file {
             size_bytes,
             mime,
             owner,
+            walrus_end_epoch,
             created_at: clock::timestamp_ms(clock),
         };
         transfer::transfer(file, tx_context::sender(ctx));
@@ -39,6 +42,7 @@ module floe::file {
         size_bytes: u64,
         mime: String,
         owner: Option<address>,
+        walrus_end_epoch: Option<u64>,
         clock: &Clock,
         ctx: &mut TxContext
     ) {
@@ -48,6 +52,7 @@ module floe::file {
             size_bytes,
             mime,
             owner,
+            walrus_end_epoch,
             created_at: clock::timestamp_ms(clock),
         };
         

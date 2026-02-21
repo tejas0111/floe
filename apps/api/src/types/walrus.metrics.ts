@@ -22,7 +22,6 @@ export interface WalrusUploadMetric {
   error?: string;
   httpStatus?: number;
   walrusCost?: number | string;
-  walrusObjectId?: string;
   walrusEndEpoch?: number;
   network: "mainnet" | "testnet";
   timestamp: number;
@@ -31,6 +30,9 @@ export interface WalrusUploadMetric {
 export function recordWalrusUploadMetric(
   metric: WalrusUploadMetric
 ) {
+  if (process.env.FLOE_LOG_WALRUS_METRICS !== "1") {
+    return;
+  }
   console.info("[walrus.upload.metric]", metric);
 }
 
