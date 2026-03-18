@@ -1,5 +1,3 @@
-// src/types/upload.ts
-
 export type UploadStatus =
   | "uploading"
   | "finalizing"
@@ -19,11 +17,4 @@ export interface UploadSession {
   status: UploadStatus;
   createdAt: number;
   expiresAt: number;
-}
-
-export interface CompleteUploadResult {
-  fileId: string;
-  blobId: string;
-  sizeBytes: number;
-  status: "ready";
 }

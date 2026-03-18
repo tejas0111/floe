@@ -1,15 +1,17 @@
-// src/routes/files.routes.ts
-
 import { FastifyInstance } from "fastify";
 import { Readable } from "node:stream";
 
-import { suiClient } from "../sui/client.js";
-import { getRedis } from "../state/client.js";
-import { fileKeys } from "../state/keys.js";
-import { fetchWalrusBlob } from "../services/upload/walrus.read.js";
+import { suiClient } from "../state/sui.js";
+import { getIndexedFile, upsertIndexedFile } from "../db/files.repository.js";
+import { fetchWalrusBlob } from "../services/walrus/read.js";
 import { WalrusReadLimits } from "../config/walrus.config.js";
 import { sendApiError } from "../utils/apiError.js";
 import { applyRateLimitHeaders } from "../services/auth/auth.headers.js";
+import {
+  observeMetadataLookup,
+  observeStreamTtfb,
+  recordStreamReadError,
+} from "../services/metrics/runtime.metrics.js";
 
 function inferContainerFromMime(mimeType: string): string | null {
   const m = (mimeType ?? "").toLowerCase();
@@ -18,6 +20,17 @@ function inferContainerFromMime(mimeType: string): string | null {
   if (m.includes("quicktime")) return "mov";
   if (m.includes("x-matroska") || m.includes("mkv")) return "mkv";
   return null;
+}
+
+function classifyStreamErrorReason(message: string): string {
+  const msg = (message ?? "").toUpperCase();
+  if (msg.includes("FILE_BLOB_UNAVAILABLE")) return "blob_unavailable";
+  if (msg.includes("INVALID_RANGE")) return "invalid_range";
+  if (msg.includes("WALRUS_RANGE_FAILED")) return "walrus_range_failed";
+  if (msg.includes("WALRUS_EMPTY_SEGMENT")) return "walrus_empty_segment";
+  if (msg.includes("WALRUS_SEGMENT_OVERRUN")) return "walrus_segment_overrun";
+  if (msg.includes("ABORT")) return "aborted";
+  return "other";
 }
 
 function shouldExposeBlobId(req: any): boolean {
@@ -39,8 +52,18 @@ type NormalizedFileFields = {
   mimeType: string;
   createdAt: number;
   owner: unknown;
+  ownerAddress: string | null;
   walrusEndEpoch: number | null;
 };
+
+const SUI_ADDRESS_RE = /^(0x)?[0-9a-fA-F]{64}$/;
+
+function normalizeSuiAddress(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const value = raw.trim();
+  if (!SUI_ADDRESS_RE.test(value)) return null;
+  return `0x${value.replace(/^0x/i, "").toLowerCase()}`;
+}
 
 function parseOptionalU64(raw: unknown): number | null {
   if (raw === null || raw === undefined) return null;
@@ -86,6 +109,7 @@ function normalizeFileFields(fields: any): NormalizedFileFields | null {
     mimeType,
     createdAt: rawCreatedAt,
     owner: fields.owner ?? null,
+    ownerAddress: normalizeSuiAddress(fields.owner),
     walrusEndEpoch: parseOptionalU64(fields.walrus_end_epoch),
   };
 }
@@ -130,29 +154,86 @@ function parseSingleRangeHeader(params: {
   return { range: { start, end }, kind: "bounded" };
 }
 
-const FILE_FIELDS_CACHE_TTL_MS = Number(
-  process.env.FLOE_FILE_FIELDS_CACHE_TTL_MS ?? 24 * 60 * 60_000
+const FILE_FIELDS_MEMORY_CACHE_TTL_MS = Number(
+  process.env.FLOE_FILE_FIELDS_MEMORY_CACHE_TTL_MS ?? 60_000
 );
+const FILE_FIELDS_MEMORY_CACHE_MAX = Number(
+  process.env.FLOE_FILE_FIELDS_MEMORY_CACHE_MAX_ENTRIES ?? 5000
+);
+const FILE_FIELDS_DEBUG = process.env.FLOE_FILE_FIELDS_DEBUG === "1";
 
-function fileFieldsCacheKey(fileId: string) {
-  return fileKeys.fields(fileId);
+type FileFieldsSource = "memory" | "postgres" | "sui";
+type CachedFileFieldsResult = {
+  fields: any | null;
+  source: FileFieldsSource | null;
+};
+
+const fileFieldsMemoryCache = new Map<
+  string,
+  { value: any; expiresAt: number; touchedAt: number }
+>();
+
+function getMemoryFileFields(fileId: string): any | null {
+  if (!Number.isFinite(FILE_FIELDS_MEMORY_CACHE_TTL_MS) || FILE_FIELDS_MEMORY_CACHE_TTL_MS <= 0) {
+    return null;
+  }
+  const now = Date.now();
+  const hit = fileFieldsMemoryCache.get(fileId);
+  if (!hit) return null;
+  if (hit.expiresAt <= now) {
+    fileFieldsMemoryCache.delete(fileId);
+    return null;
+  }
+  hit.touchedAt = now;
+  return hit.value;
 }
 
-async function getFileFieldsCached(fileId: string): Promise<any | null> {
-  const redis = getRedis();
+function setMemoryFileFields(fileId: string, fields: any) {
+  if (!Number.isFinite(FILE_FIELDS_MEMORY_CACHE_TTL_MS) || FILE_FIELDS_MEMORY_CACHE_TTL_MS <= 0) {
+    return;
+  }
+  const now = Date.now();
+  fileFieldsMemoryCache.set(fileId, {
+    value: fields,
+    expiresAt: now + FILE_FIELDS_MEMORY_CACHE_TTL_MS,
+    touchedAt: now,
+  });
 
-  if (Number.isFinite(FILE_FIELDS_CACHE_TTL_MS) && FILE_FIELDS_CACHE_TTL_MS > 0) {
-    const cached = await redis
-      .get<string>(fileFieldsCacheKey(fileId))
-      .catch(() => null);
+  const maxEntries = Number.isFinite(FILE_FIELDS_MEMORY_CACHE_MAX) && FILE_FIELDS_MEMORY_CACHE_MAX > 0
+    ? Math.floor(FILE_FIELDS_MEMORY_CACHE_MAX)
+    : 5000;
+  if (fileFieldsMemoryCache.size <= maxEntries) return;
 
-    if (cached) {
-      try {
-        return JSON.parse(cached);
-      } catch {
-        // Ignore corrupt cache entries.
-      }
-    }
+  // Drop least-recently-touched entries when we exceed max size.
+  let over = fileFieldsMemoryCache.size - maxEntries;
+  const entries = [...fileFieldsMemoryCache.entries()].sort(
+    (a, b) => a[1].touchedAt - b[1].touchedAt
+  );
+  for (const [k] of entries) {
+    if (over <= 0) break;
+    fileFieldsMemoryCache.delete(k);
+    over -= 1;
+  }
+}
+
+async function getFileFieldsCached(fileId: string): Promise<CachedFileFieldsResult> {
+  const memory = getMemoryFileFields(fileId);
+  if (memory) {
+    return { fields: memory, source: "memory" };
+  }
+
+  const indexed = await getIndexedFile(fileId).catch(() => null);
+  if (indexed) {
+    const fields = {
+      blob_id: indexed.blobId,
+      size_bytes: indexed.sizeBytes,
+      mime: indexed.mimeType,
+      created_at: indexed.createdAtMs,
+      owner: indexed.ownerAddress,
+      walrus_end_epoch: indexed.walrusEndEpoch,
+    };
+    setMemoryFileFields(fileId, fields);
+    return { fields, source: "postgres" };
   }
 
   const obj = await suiClient.getObject({
@@ -161,20 +242,25 @@ async function getFileFieldsCached(fileId: string): Promise<any | null> {
   });
 
   if (!obj.data?.content || obj.data.content.dataType !== "moveObject") {
-    return null;
+    return { fields: null, source: null };
   }
 
   const fields = obj.data.content.fields as any;
-
-  if (Number.isFinite(FILE_FIELDS_CACHE_TTL_MS) && FILE_FIELDS_CACHE_TTL_MS > 0) {
-    await redis
-      .set(fileFieldsCacheKey(fileId), JSON.stringify(fields), {
-        px: FILE_FIELDS_CACHE_TTL_MS,
-      })
-      .catch(() => {});
+  setMemoryFileFields(fileId, fields);
+  const normalized = normalizeFileFields(fields);
+  if (normalized) {
+    await upsertIndexedFile({
+      fileId,
+      blobId: normalized.blobId,
+      ownerAddress: normalized.ownerAddress,
+      sizeBytes: normalized.sizeBytes,
+      mimeType: normalized.mimeType,
+      walrusEndEpoch: normalized.walrusEndEpoch,
+      createdAtMs: normalized.createdAt,
+    }).catch(() => {});
   }
 
-  return fields;
+  return { fields, source: "sui" };
 }
 
 async function* walrusByteStream(params: {
@@ -188,7 +274,6 @@ async function* walrusByteStream(params: {
     const trimmed = (body ?? "").trim();
     if (!trimmed) return "";
     const snippet = trimmed.slice(0, 160);
-    // Keep only readable ASCII to avoid binary log spam.
     const ascii = snippet.replace(/[^\x20-\x7E]/g, "");
     return ascii;
   };
@@ -205,7 +290,6 @@ async function* walrusByteStream(params: {
       return err;
     }
 
-    // Upstream read errors should not be surfaced as a generic 500.
     err.statusCode = upstreamStatus >= 500 ? 503 : 502;
     return err;
   };
@@ -222,20 +306,31 @@ async function* walrusByteStream(params: {
   while (offset <= params.end) {
     if (params.signal.aborted) return;
 
-    // Start optimistic, shrink on 416.
     let segSize = Math.min(maxSegmentBytes, params.end - offset + 1);
 
     while (true) {
       const segEnd = Math.min(params.end, offset + segSize - 1);
 
-      const { res: upstream } = await fetchWalrusBlob({
-        blobId: params.blobId,
-        rangeHeader: `bytes=${offset}-${segEnd}`,
-        signal: params.signal,
-      });
+      let upstream: Response;
+      try {
+        ({ res: upstream } = await fetchWalrusBlob({
+          blobId: params.blobId,
+          rangeHeader: `bytes=${offset}-${segEnd}`,
+          signal: params.signal,
+        }));
+      } catch (err) {
+        if (params.signal.aborted || (err as any)?.name === "AbortError") {
+          return;
+        }
 
-      // Some public aggregators enforce strict/low max range sizes and return 416.
-      // Adapt by shrinking the request until it succeeds.
+        if (segSize > minSegmentBytes) {
+          segSize = Math.max(minSegmentBytes, Math.floor(segSize / 2));
+          continue;
+        }
+
+        throw err;
+      }
+
       if (upstream.status === 416 && segSize > minSegmentBytes) {
         segSize = Math.max(minSegmentBytes, Math.floor(segSize / 2));
         continue;
@@ -245,8 +340,6 @@ async function* walrusByteStream(params: {
         params.start === 0 && offset === 0 && segEnd === params.end;
 
       if (upstream.status === 200 && isFullObjectAttempt) {
-        // Some aggregators return 200 for full-span requests even with a Range header.
-        // Accept this when we are fetching the whole object in one segment.
       } else if (upstream.status !== 206) {
         const text = await upstream.text().catch(() => "");
         throw makeWalrusReadError(upstream.status, text);
@@ -273,8 +366,6 @@ async function* walrusByteStream(params: {
           );
         }
 
-        // Upstream cut the connection early. Retry the remaining bytes.
-        // We keep the HTTP response to the client intact; this happens server-side.
         offset += read;
         segSize = Math.max(minSegmentBytes, Math.floor(segSize / 2));
         continue;
@@ -296,7 +387,7 @@ export async function filesRoutes(app: FastifyInstance) {
   app.get("/v1/files/:fileId/metadata", async (req, res) => {
     const readLimit = await req.server.authProvider.checkRateLimit({
       req,
-      scope: "file_read",
+      scope: "file_meta_read",
     });
     applyRateLimitHeaders(res, readLimit);
     if (!readLimit.allowed) {
@@ -308,8 +399,12 @@ export async function filesRoutes(app: FastifyInstance) {
     const { fileId } = req.params as { fileId: string };
 
     let fields: any | null = null;
+    let fieldsSource: FileFieldsSource | null = null;
+    const t0 = Date.now();
     try {
-      fields = await getFileFieldsCached(fileId);
+      const out = await getFileFieldsCached(fileId);
+      fields = out.fields;
+      fieldsSource = out.source;
     } catch (err) {
       req.log.error({ err, fileId }, "Sui read failed");
       return sendApiError(
@@ -336,8 +431,34 @@ export async function filesRoutes(app: FastifyInstance) {
       );
     }
 
+    if (FILE_FIELDS_DEBUG) {
+      req.log.info(
+        { fileId, source: fieldsSource ?? "unknown", durationMs: Date.now() - t0 },
+        "metadata fields lookup"
+      );
+    }
+    observeMetadataLookup({
+      endpoint: "metadata",
+      source: fieldsSource ?? "unknown",
+      durationMs: Date.now() - t0,
+    });
+
     const exposeBlobId = shouldExposeBlobId(req);
     const container = inferContainerFromMime(normalized.mimeType);
+    const authz = await req.server.authProvider.authorizeFileAccess({
+      req,
+      action: "metadata",
+      fileId,
+      fileOwner: normalized.ownerAddress,
+    });
+    if (!authz.allowed) {
+      return sendApiError(
+        res,
+        403,
+        "OWNER_MISMATCH",
+        authz.message ?? "File access denied"
+      );
+    }
 
     return {
       fileId,
@@ -355,7 +476,7 @@ export async function filesRoutes(app: FastifyInstance) {
   app.get("/v1/files/:fileId/manifest", async (req, res) => {
     const readLimit = await req.server.authProvider.checkRateLimit({
       req,
-      scope: "file_read",
+      scope: "file_meta_read",
     });
     applyRateLimitHeaders(res, readLimit);
     if (!readLimit.allowed) {
@@ -367,8 +488,12 @@ export async function filesRoutes(app: FastifyInstance) {
     const { fileId } = req.params as { fileId: string };
 
     let fields: any | null = null;
+    let fieldsSource: FileFieldsSource | null = null;
+    const t0 = Date.now();
     try {
-      fields = await getFileFieldsCached(fileId);
+      const out = await getFileFieldsCached(fileId);
+      fields = out.fields;
+      fieldsSource = out.source;
     } catch (err) {
       req.log.error({ err, fileId }, "Sui read failed");
       return sendApiError(
@@ -395,8 +520,34 @@ export async function filesRoutes(app: FastifyInstance) {
       );
     }
 
+    if (FILE_FIELDS_DEBUG) {
+      req.log.info(
+        { fileId, source: fieldsSource ?? "unknown", durationMs: Date.now() - t0 },
+        "manifest fields lookup"
+      );
+    }
+    observeMetadataLookup({
+      endpoint: "manifest",
+      source: fieldsSource ?? "unknown",
+      durationMs: Date.now() - t0,
+    });
+
     const exposeBlobId = shouldExposeBlobId(req);
     const container = inferContainerFromMime(normalized.mimeType);
+    const authz = await req.server.authProvider.authorizeFileAccess({
+      req,
+      action: "manifest",
+      fileId,
+      fileOwner: normalized.ownerAddress,
+    });
+    if (!authz.allowed) {
+      return sendApiError(
+        res,
+        403,
+        "OWNER_MISMATCH",
+        authz.message ?? "File access denied"
+      );
+    }
 
     return {
       manifestVersion: 1,
@@ -426,7 +577,7 @@ export async function filesRoutes(app: FastifyInstance) {
     handler: async (req, reply) => {
       const readLimit = await req.server.authProvider.checkRateLimit({
         req,
-        scope: "file_read",
+        scope: "file_stream_read",
       });
       applyRateLimitHeaders(reply, readLimit);
       if (!readLimit.allowed) {
@@ -438,8 +589,12 @@ export async function filesRoutes(app: FastifyInstance) {
       const { fileId } = req.params as { fileId: string };
 
       let fields: any | null = null;
+      let fieldsSource: FileFieldsSource | null = null;
+      const t0 = Date.now();
       try {
-        fields = await getFileFieldsCached(fileId);
+        const out = await getFileFieldsCached(fileId);
+        fields = out.fields;
+        fieldsSource = out.source;
       } catch (err) {
         req.log.error({ err, fileId }, "Sui read failed");
         return sendApiError(
@@ -466,6 +621,33 @@ export async function filesRoutes(app: FastifyInstance) {
         );
       }
 
+      if (FILE_FIELDS_DEBUG) {
+        req.log.info(
+          { fileId, source: fieldsSource ?? "unknown", durationMs: Date.now() - t0 },
+          "stream fields lookup"
+        );
+      }
+      observeMetadataLookup({
+        endpoint: "stream",
+        source: fieldsSource ?? "unknown",
+        durationMs: Date.now() - t0,
+      });
+
+      const authz = await req.server.authProvider.authorizeFileAccess({
+        req,
+        action: "stream",
+        fileId,
+        fileOwner: normalized.ownerAddress,
+      });
+      if (!authz.allowed) {
+        return sendApiError(
+          reply,
+          403,
+          "OWNER_MISMATCH",
+          authz.message ?? "File access denied"
+        );
+      }
+
       const blobId = normalized.blobId;
       const sizeBytes = normalized.sizeBytes;
       const mimeType = normalized.mimeType;
@@ -473,10 +655,7 @@ export async function filesRoutes(app: FastifyInstance) {
       reply.header("Accept-Ranges", "bytes");
       reply.header("ETag", blobId);
 
-      // Only single-range is supported.
       const rangeHeader = (req.headers as any)?.range as string | undefined;
-
-      req.log.debug({ fileId, range: rangeHeader }, "stream request");
 
       let start = 0;
       let end = sizeBytes - 1;
@@ -507,13 +686,12 @@ export async function filesRoutes(app: FastifyInstance) {
       const abortUpstream = () => abortController.abort();
       const detachAbortHooks = () => {
         req.raw.removeListener("aborted", abortUpstream);
-        req.raw.removeListener("close", abortUpstream);
+        reply.raw.removeListener("close", abortUpstream);
       };
       req.raw.once("aborted", abortUpstream);
-      req.raw.once("close", abortUpstream);
+      reply.raw.once("close", abortUpstream);
 
       const span = end - start + 1;
-      const isWholeFileRead = !rangeHeader;
 
       reply.header("Content-Type", mimeType);
       reply.header("Content-Length", String(span));
@@ -527,16 +705,30 @@ export async function filesRoutes(app: FastifyInstance) {
         return reply.status(status).send();
       }
 
+      const streamStartMs = Date.now();
+      let firstByteObserved = false;
       const stream = Readable.from(
-        walrusByteStream({
-          blobId,
-          start,
-          end,
-          // Whole-file reads may be served as HTTP 200 by some Walrus aggregators.
-          // Force one segment so the streamer can accept a full-object 200 response.
-          maxSegmentBytes: isWholeFileRead ? span : WalrusReadLimits.maxRangeBytes,
-          signal: abortController.signal,
-        })
+        (async function* () {
+          for await (const chunk of walrusByteStream({
+            blobId,
+            start,
+            end,
+            maxSegmentBytes: Math.min(
+              WalrusReadLimits.maxRangeBytes,
+              WalrusReadLimits.mediaSegmentBytes
+            ),
+            signal: abortController.signal,
+          })) {
+            if (!firstByteObserved && chunk.byteLength > 0) {
+              firstByteObserved = true;
+              observeStreamTtfb({
+                range: rangeHeader ? "partial" : "full",
+                durationMs: Date.now() - streamStartMs,
+              });
+            }
+            yield chunk;
+          }
+        })()
       );
       stream.once("end", detachAbortHooks);
       stream.once("close", detachAbortHooks);
@@ -545,6 +737,7 @@ export async function filesRoutes(app: FastifyInstance) {
         if (err?.message === "FILE_CONTENT_NOT_FOUND") {
           err.message = "FILE_BLOB_UNAVAILABLE";
         }
+        recordStreamReadError(classifyStreamErrorReason(String(err?.message ?? "")));
       });
 
       return reply.status(status).send(stream);

@@ -17,7 +17,11 @@ const LIMIT_DEFAULTS = {
     public: 30,
     authenticated: 1200,
   },
-  file_read: {
+  file_meta_read: {
+    public: 240,
+    authenticated: 2400,
+  },
+  file_stream_read: {
     public: 120,
     authenticated: 1200,
   },
@@ -32,9 +36,13 @@ const LIMIT_ENV = {
     public: "FLOE_RATE_LIMIT_UPLOAD_CHUNK_PUBLIC",
     authenticated: "FLOE_RATE_LIMIT_UPLOAD_CHUNK_AUTH",
   },
-  file_read: {
-    public: "FLOE_RATE_LIMIT_FILE_READ_PUBLIC",
-    authenticated: "FLOE_RATE_LIMIT_FILE_READ_AUTH",
+  file_meta_read: {
+    public: "FLOE_RATE_LIMIT_FILE_META_PUBLIC",
+    authenticated: "FLOE_RATE_LIMIT_FILE_META_AUTH",
+  },
+  file_stream_read: {
+    public: "FLOE_RATE_LIMIT_FILE_STREAM_PUBLIC",
+    authenticated: "FLOE_RATE_LIMIT_FILE_STREAM_AUTH",
   },
 } as const;
 

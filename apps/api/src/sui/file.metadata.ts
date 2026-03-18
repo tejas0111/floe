@@ -1,7 +1,5 @@
-// src/sui/file.metadata.ts
-
 import { Transaction } from "@mysten/sui/transactions";
-import { suiClient, suiSigner } from "./client.js";
+import { suiClient, suiSigner } from "../state/sui.js";
 
 const SUI_PACKAGE_ID = process.env.SUI_PACKAGE_ID;
 

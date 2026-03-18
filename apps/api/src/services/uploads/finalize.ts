@@ -1,17 +1,17 @@
-// src/services/upload/upload.finalize.ts
-
 import fs from "fs/promises";
 import path from "path";
 import { Readable } from "stream";
 import crypto from "crypto";
 
 import { UploadConfig } from "../../config/uploads.config.js";
-import { InternalSession } from "./upload.session.js";
-import { getRedis } from "../../state/client.js";
-import { uploadKeys, fileKeys } from "../../state/keys.js";
+import { InternalSession } from "./session.js";
+import { getRedis } from "../../state/redis.js";
+import { uploadKeys } from "../../state/keys.js";
 import { chunkStore } from "../../store/index.js";
-import { uploadToWalrusWithMetrics } from "./walrus.metrics.js";
+import { uploadToWalrusWithMetrics } from "../walrus/metrics.js";
 import { finalizeFileMetadata } from "../../sui/file.metadata.js";
+import { observeSuiFinalize } from "../metrics/runtime.metrics.js";
+import { upsertIndexedFile } from "../../db/files.repository.js";
 
 const finalFilePath = (uploadId: string) =>
   path.join(UploadConfig.tmpDir, `${uploadId}.bin`);
@@ -165,13 +165,11 @@ export async function finalizeUpload(session: InternalSession): Promise<{
       }
     }
 
-    // Checkpointed fields (best-effort).
     let blobId: string | null = meta?.blobId ?? null;
     let fileId: string | null = meta?.fileId ?? null;
     let walrusEndEpoch: number | undefined =
       meta?.walrusEndEpoch !== undefined ? Number(meta.walrusEndEpoch) : undefined;
 
-    // Only assemble/upload if we don't already have a durable blobId checkpoint.
     if (!blobId) {
       assertFinalizeLockHealthy();
       await refreshFinalizeLock();
@@ -179,7 +177,6 @@ export async function finalizeUpload(session: InternalSession): Promise<{
         uploadId,
         sizeBytes: session.sizeBytes,
         epochs: session.resolvedEpochs,
-        // Re-creatable stream for Walrus retries without creating a duplicate .bin file.
         streamFactory: () =>
           createChunkAssemblyStream({
             uploadId,
@@ -194,7 +191,6 @@ export async function finalizeUpload(session: InternalSession): Promise<{
         throw new Error("WALRUS_UPLOAD_FAILED");
       }
 
-      // Checkpoint immediately so retries don't re-upload and re-pay.
       await redis.hset(metaKey, {
         blobId,
         walrusUploadedAt: String(Date.now()),
@@ -205,47 +201,35 @@ export async function finalizeUpload(session: InternalSession): Promise<{
     if (!fileId) {
       assertFinalizeLockHealthy();
       await refreshFinalizeLock();
-      const minted = await finalizeFileMetadata({
-        blobId,
-        sizeBytes: session.sizeBytes,
-        mimeType: session.contentType ?? "application/octet-stream",
-        owner: session.owner,
-        walrusEndEpoch,
-      });
+      const suiStartedAt = Date.now();
+      let minted;
+      try {
+        minted = await finalizeFileMetadata({
+          blobId,
+          sizeBytes: session.sizeBytes,
+          mimeType: session.contentType ?? "application/octet-stream",
+          owner: session.owner,
+          walrusEndEpoch,
+        });
+        observeSuiFinalize({
+          durationMs: Date.now() - suiStartedAt,
+          outcome: "success",
+        });
+      } catch (err) {
+        observeSuiFinalize({
+          durationMs: Date.now() - suiStartedAt,
+          outcome: "failure",
+        });
+        throw err;
+      }
 
       fileId = minted.fileId;
 
-      // Cache fields immediately so streaming does not depend on Sui RPC availability.
-      await redis
-        .set(
-          fileKeys.fields(fileId),
-          JSON.stringify({
-            blob_id: blobId,
-            size_bytes: session.sizeBytes,
-            mime: session.contentType ?? "application/octet-stream",
-            created_at: Date.now(),
-            owner: session.owner ?? null,
-            walrus_end_epoch: walrusEndEpoch ?? null,
-          }),
-          {
-            px: Number(process.env.FLOE_FILE_FIELDS_CACHE_TTL_MS ?? 24 * 60 * 60_000),
-          }
-        )
-        .catch(() => {});
-
-      // Checkpoint early to reduce duplicate mint risk on retry.
       await redis.hset(metaKey, {
         fileId,
         metadataFinalizedAt: String(Date.now()),
       });
     }
-
-    assertFinalizeLockHealthy();
-    await refreshFinalizeLock();
-    await chunkStore.cleanup(uploadId);
-    await fs
-      .unlink(finalFilePath(uploadId))
-      .catch(() => {});
 
     assertFinalizeLockHealthy();
     await refreshFinalizeLock();
@@ -267,6 +251,21 @@ export async function finalizeUpload(session: InternalSession): Promise<{
     if (!tx) {
       throw new Error("REDIS_FINALIZE_TRANSACTION_FAILED");
     }
+
+    await upsertIndexedFile({
+      fileId,
+      blobId,
+      ownerAddress: session.owner ?? null,
+      sizeBytes: session.sizeBytes,
+      mimeType: session.contentType ?? "application/octet-stream",
+      walrusEndEpoch: walrusEndEpoch ?? null,
+      createdAtMs: Date.now(),
+    }).catch(() => {});
+
+    await Promise.all([
+      chunkStore.cleanup(uploadId).catch(() => {}),
+      fs.unlink(finalFilePath(uploadId)).catch(() => {}),
+    ]);
 
     return {
       fileId,

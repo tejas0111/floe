@@ -1,9 +1,9 @@
 module floe::file {
-    use sui::object::{UID};
-    use sui::tx_context::{TxContext};
+    use sui::object::{Self as object, UID};
+    use sui::tx_context::{Self as tx_context, TxContext};
     use sui::clock::{Self, Clock};
     use sui::transfer;
-    use std::option::{Option};
+    use std::option::{Self as option, Option};
     use std::string::String;
     
     public struct FileMeta has key {

@@ -1,5 +1,3 @@
-// src/server.ts
-
 import Fastify from "fastify";
 import multipart from "@fastify/multipart";
 import cors from "@fastify/cors";
@@ -7,12 +5,22 @@ import fs from "fs/promises";
 import os from "os";
 import path from "path";
 
-import uploadRoutes from "./routes/uploads.routes.js";
+import uploadRoutes from "./routes/uploads.js";
 import healthRoute from "./routes/health.js";
-import { filesRoutes } from "./routes/files.routes.js";
-import { initRedis } from "./state/client.js";
+import { filesRoutes } from "./routes/files.js";
+import { initRedis } from "./state/redis.js";
+import {
+  closePostgres,
+  initPostgres,
+  isPostgresConfigured,
+} from "./state/postgres.js";
+import { initS3IfEnabled } from "./state/s3.js";
 import { startUploadGc, stopUploadGc } from "./state/gc/upload.gc.scheduler.js";
 import { reconcileOrphanUploads } from "./state/gc/upload.gc.reconcile.js";
+import {
+  startUploadFinalizeWorker,
+  stopUploadFinalizeWorker,
+} from "./services/uploads/finalize.queue.js";
 import { ChunkConfig, UploadConfig } from "./config/uploads.config.js";
 import {
   createDefaultAuthProvider,
@@ -23,6 +31,9 @@ import {
   AuthRateLimitConfig,
   AuthUploadPolicyConfig,
 } from "./config/auth.config.js";
+import { recordHttpRequest } from "./services/metrics/runtime.metrics.js";
+import { ensureFilesTable } from "./db/files.repository.js";
+import { chunkStore } from "./store/index.js";
 
 process.on("unhandledRejection", (reason) => {
   console.error("Unhandled promise rejection:", reason);
@@ -42,7 +53,6 @@ function createFastifyApp() {
         remove: true,
       },
     },
-    // Requests should be chunk-sized (multipart) or small JSON.
     bodyLimit: ChunkConfig.maxBytes + 1024 * 1024,
   });
 }
@@ -57,6 +67,10 @@ function parseCorsOrigins(): string[] {
 }
 
 async function validateUploadTmpDir() {
+  if (chunkStore.backend() !== "disk") {
+    return;
+  }
+
   const dir = UploadConfig.tmpDir;
   const home = os.homedir();
 
@@ -69,8 +83,6 @@ async function validateUploadTmpDir() {
 
   await fs.mkdir(dir, { recursive: true });
 
-  // Verify we can write to the directory. This prevents starting with a
-  // misconfigured path that will later fail during uploads/GC/cancel.
   const probe = path.join(dir, `.floe_write_test_${process.pid}_${Date.now()}`);
   await fs.writeFile(probe, "ok");
   await fs.unlink(probe);
@@ -83,6 +95,15 @@ export async function createApiServer(params?: { authProvider?: AuthProvider }) 
   app.decorate("authProvider", params?.authProvider ?? createDefaultAuthProvider());
   app.addHook("onRequest", async (req, reply) => {
     reply.header("x-request-id", req.id);
+  });
+  app.addHook("onResponse", async (req, reply) => {
+    const route = req.routeOptions?.url ?? req.url.split("?")[0];
+    recordHttpRequest({
+      method: req.method,
+      route,
+      statusCode: reply.statusCode,
+      durationMs: Number(reply.elapsedTime ?? 0),
+    });
   });
 
   await app.register(cors, {
@@ -105,6 +126,7 @@ export async function createApiServer(params?: { authProvider?: AuthProvider }) 
       "x-owner-address",
       "x-auth-user",
       "x-chunk-sha256",
+      "x-floe-sdk",
     ],
     exposedHeaders: ["x-request-id", "x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-window", "retry-after"],
     maxAge: 600,
@@ -122,27 +144,38 @@ export async function createApiServer(params?: { authProvider?: AuthProvider }) 
 
   try {
     await initRedis();
+    await initS3IfEnabled(app.log);
+    await initPostgres(app.log);
+    await ensureFilesTable();
     await validateUploadTmpDir();
     app.log.info(
       {
         limits: {
           uploadControl: AuthRateLimitConfig.limits.upload_control,
           uploadChunk: AuthRateLimitConfig.limits.upload_chunk,
-          fileRead: AuthRateLimitConfig.limits.file_read,
+          fileMetaRead: AuthRateLimitConfig.limits.file_meta_read,
+          fileStreamRead: AuthRateLimitConfig.limits.file_stream_read,
           uploadMaxFileSizeBytes: UploadConfig.maxFileSizeBytes,
           publicMaxFileSizeBytes: AuthUploadPolicyConfig.maxFileSizeBytes.public,
           authMaxFileSizeBytes: AuthUploadPolicyConfig.maxFileSizeBytes.authenticated,
           enforceUploadOwner: AuthOwnerPolicyConfig.enforceUploadOwner,
         },
+        postgres: {
+          configured: isPostgresConfigured(),
+        },
+        chunkStore: {
+          backend: chunkStore.backend(),
+        },
       },
       "Redis initialized and config loaded"
     );
   } catch (err) {
-    app.log.error(err, "Failed to initialize Redis");
+    app.log.error(err, "Failed to initialize dependencies");
     throw err;
   }
 
   await reconcileOrphanUploads(app.log);
+  await startUploadFinalizeWorker(app.log);
   startUploadGc(app.log);
 
   await app.register(uploadRoutes);
@@ -205,6 +238,8 @@ async function start() {
 
     try {
       await stopUploadGc();
+      await stopUploadFinalizeWorker();
+      await closePostgres();
       await app.close();
       process.exit(0);
     } catch (err) {

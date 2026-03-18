@@ -1,5 +1,3 @@
-// src/routes/uploads.routes.ts
-
 import { FastifyInstance } from "fastify";
 import crypto from "crypto";
 import fs from "fs/promises";
@@ -8,17 +6,17 @@ import path from "path";
 import { sendApiError } from "../utils/apiError.js";
 import { ChunkConfig, UploadConfig } from "../config/uploads.config.js";
 import { WalrusEpochLimits } from "../config/walrus.config.js";
-import {
-  AuthOwnerPolicyConfig,
-  AuthUploadPolicyConfig,
-} from "../config/auth.config.js";
+import { AuthUploadPolicyConfig } from "../config/auth.config.js";
 
-import { createSession, getSession } from "../services/upload/upload.session.js";
-import { finalizeUpload } from "../services/upload/upload.finalize.js";
+import { createSession, getSession } from "../services/uploads/session.js";
+import {
+  enqueueUploadFinalize,
+  isUploadFinalizeQueued,
+} from "../services/uploads/finalize.queue.js";
 import { applyRateLimitHeaders } from "../services/auth/auth.headers.js";
 
 import { chunkStore } from "../store/index.js";
-import { getRedis } from "../state/client.js";
+import { getRedis } from "../state/redis.js";
 import { uploadKeys } from "../state/keys.js";
 
 function isUuid(value: unknown): value is string {
@@ -50,20 +48,19 @@ function parseOptionalSuiAddressEnv(name: string): string | undefined {
   return `0x${raw.replace(/^0x/i, "").toLowerCase()}`;
 }
 
+function parsePositiveIntEnv(name: string, fallback: number, min = 1): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < min) {
+    throw new Error(`${name} must be an integer >= ${min}`);
+  }
+  return n;
+}
+
 const DEFAULT_OWNER_ADDRESS = parseOptionalSuiAddressEnv("FLOE_DEFAULT_OWNER_ADDRESS");
 
-function assertOwnerAccess(params: {
-  expectedOwner?: string | null;
-  requestOwner?: string;
-}) {
-  if (!AuthOwnerPolicyConfig.enforceUploadOwner) return;
-  const expected = params.expectedOwner?.trim();
-  if (!expected) return;
-  const provided = params.requestOwner?.trim();
-  if (!provided || provided.toLowerCase() !== expected.toLowerCase()) {
-    throw new Error("OWNER_MISMATCH");
-  }
-}
+const FINALIZE_POLL_AFTER_MS = parsePositiveIntEnv("FLOE_FINALIZE_STATUS_POLL_MS", 2000);
 
 async function tryReserveUploadCapacity(params: {
   maxActiveUploads: number;
@@ -267,7 +264,6 @@ export default async function uploadRoutes(app: FastifyInstance) {
         }
       );
     } finally {
-      // If session creation failed, release reservation.
       if (!sessionCreated) {
         await redis
           .multi()
@@ -310,13 +306,19 @@ export default async function uploadRoutes(app: FastifyInstance) {
     if (!session) {
       return sendApiError(reply, 404, "UPLOAD_NOT_FOUND", "Invalid uploadId");
     }
-    try {
-      assertOwnerAccess({
-        expectedOwner: session.owner,
-        requestOwner: chunkLimit.identity.owner,
-      });
-    } catch {
-      return sendApiError(reply, 403, "OWNER_MISMATCH", "Upload owner mismatch");
+    const authzChunk = await req.server.authProvider.authorizeUploadAccess({
+      req,
+      action: "chunk",
+      uploadId,
+      uploadOwner: session.owner ?? null,
+    });
+    if (!authzChunk.allowed) {
+      return sendApiError(
+        reply,
+        403,
+        "OWNER_MISMATCH",
+        authzChunk.message ?? "Upload access denied"
+      );
     }
 
     if (session.status === "completed") {
@@ -409,9 +411,17 @@ export default async function uploadRoutes(app: FastifyInstance) {
   app.get("/v1/uploads/:uploadId/status", async (req, reply) => {
     const { uploadId } = req.params as { uploadId: string };
     const exposeBlobId = shouldExposeBlobId((req as any).query);
+
+    if (!isUuid(uploadId)) {
+      return sendApiError(reply, 400, "INVALID_UPLOAD_ID", "uploadId must be a UUID");
+    }
+
+    const redis = getRedis();
+    const statusProbe = await redis.hget<string>(uploadKeys.meta(uploadId), "status");
+    const statusScope = statusProbe === "finalizing" ? "file_meta_read" : "upload_control";
     const statusLimit = await req.server.authProvider.checkRateLimit({
       req,
-      scope: "upload_control",
+      scope: statusScope,
     });
     applyRateLimitHeaders(reply, statusLimit);
     if (!statusLimit.allowed) {
@@ -423,15 +433,11 @@ export default async function uploadRoutes(app: FastifyInstance) {
           windowSeconds: statusLimit.windowSeconds,
           authenticated: statusLimit.identity.authenticated,
           authMethod: statusLimit.identity.method,
+          scope: statusScope,
         },
       });
     }
 
-    if (!isUuid(uploadId)) {
-      return sendApiError(reply, 400, "INVALID_UPLOAD_ID", "uploadId must be a UUID");
-    }
-
-    const redis = getRedis();
     const [session, meta, members] = await Promise.all([
       getSession(uploadId),
       redis.hgetall<Record<string, string>>(uploadKeys.meta(uploadId)),
@@ -444,13 +450,19 @@ export default async function uploadRoutes(app: FastifyInstance) {
       if (!status) {
         return sendApiError(reply, 404, "UPLOAD_NOT_FOUND", "Invalid uploadId");
       }
-      try {
-        assertOwnerAccess({
-          expectedOwner: meta?.owner,
-          requestOwner: statusLimit.identity.owner,
-        });
-      } catch {
-        return sendApiError(reply, 403, "OWNER_MISMATCH", "Upload owner mismatch");
+      const authzStatus = await req.server.authProvider.authorizeUploadAccess({
+        req,
+        action: "status",
+        uploadId,
+        uploadOwner: meta?.owner ?? null,
+      });
+      if (!authzStatus.allowed) {
+        return sendApiError(
+          reply,
+          403,
+          "OWNER_MISMATCH",
+          authzStatus.message ?? "Upload access denied"
+        );
       }
 
       return {
@@ -461,19 +473,26 @@ export default async function uploadRoutes(app: FastifyInstance) {
         receivedChunkCount: receivedChunks.length,
         expiresAt: meta?.expiresAt ? Number(meta.expiresAt) : null,
         status,
+        ...(status === "finalizing" ? { pollAfterMs: FINALIZE_POLL_AFTER_MS } : {}),
         ...(meta?.fileId ? { fileId: meta.fileId } : {}),
         ...(exposeBlobId && meta?.blobId ? { blobId: meta.blobId } : {}),
         ...(meta?.walrusEndEpoch ? { walrusEndEpoch: Number(meta.walrusEndEpoch) } : {}),
         ...(meta?.error ? { error: meta.error } : {}),
       };
     }
-    try {
-      assertOwnerAccess({
-        expectedOwner: session.owner,
-        requestOwner: statusLimit.identity.owner,
-      });
-    } catch {
-      return sendApiError(reply, 403, "OWNER_MISMATCH", "Upload owner mismatch");
+    const authzStatus = await req.server.authProvider.authorizeUploadAccess({
+      req,
+      action: "status",
+      uploadId,
+      uploadOwner: session.owner ?? null,
+    });
+    if (!authzStatus.allowed) {
+      return sendApiError(
+        reply,
+        403,
+        "OWNER_MISMATCH",
+        authzStatus.message ?? "Upload access denied"
+      );
     }
 
     return {
@@ -483,8 +502,14 @@ export default async function uploadRoutes(app: FastifyInstance) {
       receivedChunks,
       receivedChunkCount: receivedChunks.length,
       expiresAt: session.expiresAt,
-      status: session.status,
+      status: meta?.status ?? session.status,
+      ...((meta?.status ?? session.status) === "finalizing"
+        ? { pollAfterMs: FINALIZE_POLL_AFTER_MS }
+        : {}),
+      ...(meta?.fileId ? { fileId: meta.fileId } : {}),
+      ...(exposeBlobId && meta?.blobId ? { blobId: meta.blobId } : {}),
       ...(meta?.walrusEndEpoch ? { walrusEndEpoch: Number(meta.walrusEndEpoch) } : {}),
+      ...(meta?.error ? { error: meta.error } : {}),
     };
   });
 
@@ -520,13 +545,19 @@ export default async function uploadRoutes(app: FastifyInstance) {
       getSession(uploadId),
       redis.hgetall<Record<string, string>>(metaKey),
     ]);
-    try {
-      assertOwnerAccess({
-        expectedOwner: session?.owner ?? meta?.owner,
-        requestOwner: completeLimit.identity.owner,
-      });
-    } catch {
-      return sendApiError(reply, 403, "OWNER_MISMATCH", "Upload owner mismatch");
+    const authzComplete = await req.server.authProvider.authorizeUploadAccess({
+      req,
+      action: "complete",
+      uploadId,
+      uploadOwner: session?.owner ?? meta?.owner ?? null,
+    });
+    if (!authzComplete.allowed) {
+      return sendApiError(
+        reply,
+        403,
+        "OWNER_MISMATCH",
+        authzComplete.message ?? "Upload access denied"
+      );
     }
 
     const metaStatus = meta?.status;
@@ -552,13 +583,13 @@ export default async function uploadRoutes(app: FastifyInstance) {
       }
 
       if (metaStatus === "finalizing") {
-        return sendApiError(
-          reply,
-          409,
-          "UPLOAD_FINALIZATION_IN_PROGRESS",
-          "Upload is currently finalizing",
-          { retryable: true }
-        );
+        reply.header("Retry-After", String(Math.max(1, Math.ceil(FINALIZE_POLL_AFTER_MS / 1000))));
+        return reply.code(202).send({
+          uploadId,
+          status: "finalizing",
+          pollAfterMs: FINALIZE_POLL_AFTER_MS,
+          ...(isUploadFinalizeQueued(uploadId) ? { inProgress: true } : {}),
+        });
       }
 
       return sendApiError(reply, 404, "UPLOAD_NOT_FOUND", "Invalid uploadId");
@@ -595,50 +626,26 @@ export default async function uploadRoutes(app: FastifyInstance) {
       );
     }
 
-    try {
-      const result = await finalizeUpload(session);
-
-      log.info(
-        {
-          uploadId,
-          fileId: result.fileId,
-        },
-        "Upload finalized"
-      );
-
-      return reply.code(200).send({
-        fileId: result.fileId,
-        ...(exposeBlobId ? { blobId: result.blobId } : {}),
-        sizeBytes: result.sizeBytes,
-        status: result.status,
-        ...(result.walrusEndEpoch !== undefined ? { walrusEndEpoch: result.walrusEndEpoch } : {}),
-      });
-    } catch (err: any) {
-      if (err?.message === "UPLOAD_FINALIZATION_IN_PROGRESS") {
-        return sendApiError(
-          reply,
-          409,
-          "UPLOAD_FINALIZATION_IN_PROGRESS",
-          "Upload is currently finalizing",
-          { retryable: true }
-        );
-      }
-
-      log.error({ uploadId, err }, "Upload finalization failed");
-
+    const queued = await enqueueUploadFinalize({ uploadId, log });
+    if (queued.rejectedByBackpressure) {
       return sendApiError(
         reply,
-        502,
-        "UPLOAD_FAILED",
-        err.message ?? "Upload finalization failed",
+        503,
+        "FINALIZE_QUEUE_BACKPRESSURE",
+        "Finalize queue is saturated, retry shortly",
         { retryable: true }
       );
     }
+    reply.header("Retry-After", String(Math.max(1, Math.ceil(FINALIZE_POLL_AFTER_MS / 1000))));
+    return reply.code(202).send({
+      uploadId,
+      status: "finalizing",
+      pollAfterMs: FINALIZE_POLL_AFTER_MS,
+      enqueued: queued.enqueued,
+      ...(isUploadFinalizeQueued(uploadId) ? { inProgress: true } : {}),
+    });
   });
 
-  // Cancel an in-progress upload session. Best-effort cleanup; GC will catch any leftovers.
-  // This endpoint is intentionally idempotent: repeated cancels return 200 when the upload
-  // is already canceled/expired/failed.
   app.delete("/v1/uploads/:uploadId", async (req, reply) => {
     const log = req.log;
     const { uploadId } = req.params as { uploadId: string };
@@ -673,13 +680,19 @@ export default async function uploadRoutes(app: FastifyInstance) {
       redis.hgetall<Record<string, string>>(metaKey),
       redis.exists(lockKey),
     ]);
-    try {
-      assertOwnerAccess({
-        expectedOwner: session?.owner ?? meta?.owner,
-        requestOwner: cancelLimit.identity.owner,
-      });
-    } catch {
-      return sendApiError(reply, 403, "OWNER_MISMATCH", "Upload owner mismatch");
+    const authzCancel = await req.server.authProvider.authorizeUploadAccess({
+      req,
+      action: "cancel",
+      uploadId,
+      uploadOwner: session?.owner ?? meta?.owner ?? null,
+    });
+    if (!authzCancel.allowed) {
+      return sendApiError(
+        reply,
+        403,
+        "OWNER_MISMATCH",
+        authzCancel.message ?? "Upload access denied"
+      );
     }
 
     if (hasLock) {
@@ -693,8 +706,6 @@ export default async function uploadRoutes(app: FastifyInstance) {
 
     const status = meta?.status;
 
-    // If the session is already gone, treat delete as idempotent whenever we have
-    // a meta record to explain what happened.
     if (!session) {
       if (!status) {
         return sendApiError(reply, 404, "UPLOAD_NOT_FOUND", "Invalid uploadId");
@@ -710,12 +721,10 @@ export default async function uploadRoutes(app: FastifyInstance) {
       }
 
       if (status === "canceled" || status === "failed" || status === "expired") {
-        // Ensure this upload no longer counts against active capacity.
         await redis.srem(uploadKeys.gcIndex(), uploadId);
         return reply.code(200).send({ ok: true, uploadId, status });
       }
 
-      // Unknown/legacy state: attempt to cancel + cleanup best-effort.
       await redis.hset(metaKey, {
         status: "canceled",
         canceledAt: String(Date.now()),
@@ -756,7 +765,6 @@ export default async function uploadRoutes(app: FastifyInstance) {
       fs.rm(finalBinPath(uploadId), { force: true }).catch(() => {}),
     ]);
 
-    // Preserve meta for inspection, but remove active session/chunk state.
     await redis
       .multi()
       .del(uploadKeys.session(uploadId))

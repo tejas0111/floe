@@ -1,4 +1,3 @@
-// src/config/uploads.config.ts
 import path from "path";
 
 if (!process.env.UPLOAD_TMP_DIR) {

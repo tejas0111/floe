@@ -1,12 +1,11 @@
-// src/services/upload/upload.session.ts
-
 import fs from "fs";
 import path from "path";
 
 import { UploadConfig } from "../../config/uploads.config.js";
 import { UploadSession } from "../../types/upload.js";
-import { getRedis } from "../../state/client.js";
+import { getRedis } from "../../state/redis.js";
 import { uploadKeys } from "../../state/keys.js";
+import { chunkStore } from "../../store/index.js";
 
 
 export type InternalSession = UploadSession;
@@ -97,7 +96,9 @@ export async function createSession(input: {
   }
 
   try {
-    ensureFsFolder(uploadId);
+    if (chunkStore.backend() === "disk") {
+      ensureFsFolder(uploadId);
+    }
   } catch (err) {
     // Redis state may already exist; roll back so we don't leave orphan sessions.
     await redis

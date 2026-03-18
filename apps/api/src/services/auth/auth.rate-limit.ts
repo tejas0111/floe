@@ -1,5 +1,5 @@
 import type { FastifyRequest } from "fastify";
-import { getRedis } from "../../state/client.js";
+import { getRedis } from "../../state/redis.js";
 import {
   AuthRateLimitConfig,
   type RateLimitScope,
