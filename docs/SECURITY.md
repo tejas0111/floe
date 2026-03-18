@@ -1,53 +1,61 @@
-# Security Model
+# Security
 
-## Current State
+## Overview
 
-Floe currently provides an **auth scaffold**, not full identity verification.
+Floe is designed as developer-first video infrastructure with explicit deployment controls around upload access, file ownership, rate limiting, and operational isolation.
 
-What exists now:
+Current security-sensitive surfaces include:
 
-- request context classification (public vs authenticated-context)
-- tiered request limits
-- owner propagation field into upload session/finalization flow
+- upload creation and chunk ingestion
+- upload finalization and file metadata minting
+- file reads and stream access
+- metrics and operational endpoints
 
-What does **not** exist yet:
+## Current Controls
 
-- JWT signature/issuer/audience verification
-- API key database validation/revocation
-- wallet challenge-signature verification
-- strict authorization on file reads by owner
+Floe currently supports:
 
-## Risk Profile
+- request-tier aware rate limiting
+- optional owner propagation on uploads and file metadata
+- optional owner enforcement on upload and file access with `FLOE_ENFORCE_UPLOAD_OWNER=1`
+- token protection for `/metrics`
+- operational controls through environment-based deployment configuration
 
-At scaffold stage, auth-like headers can elevate request tier unless protected by upstream controls.
+## Deployment Guidance
 
-Use this stage for:
+For production-oriented deployments, Floe should be run behind a trusted authentication layer or paired with verified in-service identity enforcement.
 
-- internal testing
-- trusted environments
-- integration scaffolding for real auth providers
+Recommended deployment posture:
 
-## Recommended Hardening Path
+- terminate authentication at a trusted edge or gateway
+- require verified owner assignment for restricted content
+- keep metrics and operational endpoints private
+- apply standard network controls, secrets management, and logging hygiene
+- use environment-specific credentials and least-privilege access for infrastructure dependencies
 
-1. Add verified principal layer:
-- JWT verification middleware
-- API key lookup with hashed-at-rest keys
-- wallet challenge flow
+## Access Model
 
-2. Enforce authorization:
-- bind `owner` to verified principal
-- add read-access policies for `/v1/files/*`
+Floe supports owner-aware upload and file access flows. When owner enforcement is enabled, access checks are evaluated against the stored owner associated with an upload or file.
 
-3. Add abuse controls:
-- per-principal quotas/credits
-- stricter edge rate limits and WAF rules
+Deployments that require restricted content access should ensure uploads are created with a verified owner context.
 
-4. Add auditability:
-- principal-aware structured logs
-- security event metrics and alerts
+## Operational Hardening
 
-## Secrets and Key Handling
+Recommended hardening areas for production deployments:
 
-- never commit `.env` with live secrets
-- rotate Sui and Redis credentials regularly
-- restrict environment access in deployment platform
+- verified identity middleware for application-facing traffic
+- stronger authorization rules for private reads and tenant-scoped access
+- principal-aware quotas and abuse controls
+- structured security event logging and alerting
+
+## Reporting
+
+If you find a security issue, report it privately to the maintainer before opening a public issue.
+
+Include:
+
+- affected endpoint or component
+- reproduction steps
+- expected vs actual behavior
+- impact assessment
+- logs or request samples if relevant
