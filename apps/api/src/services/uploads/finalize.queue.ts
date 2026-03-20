@@ -6,6 +6,7 @@ import { uploadKeys } from "../../state/keys.js";
 import { getSession } from "./session.js";
 import { finalizeUpload } from "./finalize.js";
 import {
+  observeFinalizeQueueWait,
   recordFinalizeEnqueue,
   recordFinalizeJobResult,
   setFinalizeQueueMetrics,
@@ -54,17 +55,52 @@ const finalizeWorkers = new PQueue({
 let drainTimer: NodeJS.Timeout | null = null;
 const activeLocal = new Set<string>();
 
-function classifyFinalizeReason(message: string): string {
-  const msg = (message ?? "").toUpperCase();
-  if (msg.includes("UPLOAD_FINALIZE_TIMEOUT")) return "timeout";
-  if (msg.includes("UPLOAD_NOT_FOUND")) return "not_found";
-  if (msg.includes("INCOMPLETE_CHUNKS")) return "incomplete_chunks";
-  if (msg.includes("MISSING_CHUNKS")) return "missing_chunks";
-  if (msg.includes("WALRUS")) return "walrus";
-  if (msg.includes("SUI")) return "sui";
-  if (msg.includes("REDIS")) return "redis";
-  if (msg.includes("LOCK")) return "lock";
-  return "other";
+function classifyFinalizeFailure(err: unknown): {
+  reason: string;
+  retryable: boolean;
+  stage: string;
+} {
+  const wrapped = err as Error & { finalizeStage?: string };
+  const msg = String(wrapped?.message ?? "UPLOAD_FINALIZE_FAILED").toUpperCase();
+  const stage = wrapped.finalizeStage ?? "unknown";
+
+  if (msg.includes("UPLOAD_FINALIZE_TIMEOUT")) {
+    return { reason: "timeout", retryable: true, stage };
+  }
+  if (msg === "UPLOAD_FINALIZATION_IN_PROGRESS") {
+    return { reason: "lock_in_progress", retryable: true, stage };
+  }
+  if (msg === "UPLOAD_FINALIZATION_LOCK_LOST") {
+    return { reason: "lock_lost", retryable: true, stage };
+  }
+  if (msg.includes("UPLOAD_NOT_FOUND")) {
+    return { reason: "upload_not_found", retryable: false, stage };
+  }
+  if (msg.includes("INCOMPLETE_CHUNKS")) {
+    return { reason: "incomplete_chunks", retryable: false, stage };
+  }
+  if (msg.includes("MISSING_CHUNKS")) {
+    return { reason: "missing_chunks", retryable: false, stage };
+  }
+  if (msg.includes("WALRUS_UPLOAD_FAILED")) {
+    return { reason: "walrus_upload_failed", retryable: true, stage };
+  }
+  if (msg.includes("WALRUS")) {
+    return { reason: "walrus_unavailable", retryable: true, stage };
+  }
+  if (msg === "SUI_FILE_CREATE_FAILED") {
+    return { reason: "sui_file_create_failed", retryable: false, stage };
+  }
+  if (msg.includes("SUI")) {
+    return { reason: "sui_unavailable", retryable: true, stage };
+  }
+  if (msg.includes("REDIS")) {
+    return { reason: "redis_failure", retryable: true, stage };
+  }
+  if (msg.includes("CORRUPT_COMPLETED_UPLOAD")) {
+    return { reason: "corrupt_completed_upload", retryable: false, stage };
+  }
+  return { reason: "other", retryable: false, stage };
 }
 
 function queueKey() {
@@ -75,13 +111,26 @@ function pendingKey() {
   return uploadKeys.finalizePending();
 }
 
-async function markUploadFailed(uploadId: string, errorMessage: string) {
+async function markUploadFailed(params: {
+  uploadId: string;
+  errorMessage: string;
+  reason: string;
+  retryable: boolean;
+  stage?: string;
+  queueWaitMs?: number;
+}) {
   const redis = getRedis();
   await redis
-    .hset(uploadKeys.meta(uploadId), {
+    .hset(uploadKeys.meta(params.uploadId), {
       status: "failed",
       failedAt: String(Date.now()),
-      error: errorMessage.slice(0, 500),
+      error: params.errorMessage.slice(0, 500),
+      failedReasonCode: params.reason,
+      failedRetryable: params.retryable ? "1" : "0",
+      ...(params.stage ? { failedStage: params.stage } : {}),
+      ...(params.queueWaitMs !== undefined
+        ? { finalizeQueueWaitMs: String(params.queueWaitMs) }
+        : {}),
     })
     .catch(() => {});
 }
@@ -136,16 +185,27 @@ async function clearPending(uploadId: string): Promise<void> {
   await redis.srem(pendingKey(), uploadId);
 }
 
-async function processFinalize(uploadId: string): Promise<void> {
-  const session = await getSession(uploadId);
+async function processFinalize(params: {
+  uploadId: string;
+  log: FastifyBaseLogger;
+  attempt: number;
+  queueWaitMs: number;
+}): Promise<void> {
+  const session = await getSession(params.uploadId);
   if (!session) {
     const redis = getRedis();
-    const meta = await redis.hgetall<Record<string, string>>(uploadKeys.meta(uploadId));
+    const meta = await redis.hgetall<Record<string, string>>(
+      uploadKeys.meta(params.uploadId)
+    );
     if (meta?.status === "completed") return;
     throw new Error("UPLOAD_NOT_FOUND");
   }
 
-  await finalizeUpload(session);
+  await finalizeUpload(session, {
+    log: params.log,
+    attempt: params.attempt,
+    queueWaitMs: params.queueWaitMs,
+  });
 }
 
 async function lockRetryDelayMs(uploadId: string): Promise<number> {
@@ -168,7 +228,12 @@ async function scheduleRetry(uploadId: string, log: FastifyBaseLogger, delayMs: 
         await enqueueUploadIdForce(uploadId);
         await drainOnce(log);
       } catch (err: any) {
-        await markUploadFailed(uploadId, String(err?.message ?? "FINALIZE_REQUEUE_FAILED"));
+        await markUploadFailed({
+          uploadId,
+          errorMessage: String(err?.message ?? "FINALIZE_REQUEUE_FAILED"),
+          reason: "finalize_requeue_failed",
+          retryable: true,
+        });
         log.error({ uploadId, err }, "Finalize retry enqueue failed");
       }
     })();
@@ -179,6 +244,18 @@ async function runFinalizeJob(uploadId: string, log: FastifyBaseLogger) {
   const startedAt = Date.now();
   let timeoutHandle: NodeJS.Timeout | null = null;
   let timedOut = false;
+  const redis = getRedis();
+  const queuedAtRaw = await redis.hget<string>(uploadKeys.meta(uploadId), "finalizingQueuedAt");
+  const queueWaitMs =
+    queuedAtRaw && Number.isFinite(Number(queuedAtRaw))
+      ? Math.max(0, startedAt - Number(queuedAtRaw))
+      : 0;
+  observeFinalizeQueueWait(queueWaitMs);
+  const attempt = await redis.hincrby(uploadKeys.meta(uploadId), "finalizeAttempts", 1);
+  await redis.hset(uploadKeys.meta(uploadId), {
+    lastFinalizeAttemptAt: String(startedAt),
+    finalizeQueueWaitMs: String(queueWaitMs),
+  });
 
   try {
     timeoutHandle = setTimeout(() => {
@@ -194,12 +271,13 @@ async function runFinalizeJob(uploadId: string, log: FastifyBaseLogger) {
     }, FINALIZE_TIMEOUT_MS);
     timeoutHandle.unref?.();
 
-    await processFinalize(uploadId);
-    log.info({ uploadId }, "Upload finalize worker completed");
+    await processFinalize({ uploadId, log, attempt, queueWaitMs });
+    log.info({ uploadId, attempt, queueWaitMs }, "Upload finalize worker completed");
     await clearPending(uploadId);
     recordFinalizeJobResult({
       outcome: "success",
       durationMs: Date.now() - startedAt,
+      retryable: false,
     });
   } catch (err: any) {
     const msg = String(err?.message ?? "UPLOAD_FINALIZE_FAILED");
@@ -207,21 +285,43 @@ async function runFinalizeJob(uploadId: string, log: FastifyBaseLogger) {
       const delayMs = await lockRetryDelayMs(uploadId).catch(
         () => FINALIZE_IN_PROGRESS_RETRY_MS
       );
+      await redis
+        .hset(uploadKeys.meta(uploadId), {
+          lastFinalizeRetryAt: String(Date.now()),
+          lastFinalizeRetryDelayMs: String(delayMs),
+          failedReasonCode: "lock_in_progress",
+          failedRetryable: "1",
+        })
+        .catch(() => {});
       await scheduleRetry(uploadId, log, delayMs);
       await clearPending(uploadId);
       recordFinalizeJobResult({
         outcome: "retry_lock",
-        reason: "UPLOAD_FINALIZATION_IN_PROGRESS",
+        reason: "lock_in_progress",
         durationMs: Date.now() - startedAt,
+        retryable: true,
       });
       return;
     }
 
-    await markUploadFailed(uploadId, msg);
+    const failure = classifyFinalizeFailure(err);
+    await markUploadFailed({
+      uploadId,
+      errorMessage: msg,
+      reason: failure.reason,
+      retryable: failure.retryable,
+      stage: failure.stage,
+      queueWaitMs,
+    });
     await clearPending(uploadId);
     log.error(
       {
         uploadId,
+        attempt,
+        queueWaitMs,
+        reason: failure.reason,
+        retryable: failure.retryable,
+        failedStage: failure.stage,
         err,
         ...(timedOut ? { timeoutMs: FINALIZE_TIMEOUT_MS } : {}),
       },
@@ -231,8 +331,9 @@ async function runFinalizeJob(uploadId: string, log: FastifyBaseLogger) {
     );
     recordFinalizeJobResult({
       outcome: "failed",
-      reason: classifyFinalizeReason(msg),
+      reason: failure.reason,
       durationMs: Date.now() - startedAt,
+      retryable: failure.retryable,
     });
   } finally {
     if (timeoutHandle) {
