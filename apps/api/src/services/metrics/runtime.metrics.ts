@@ -149,11 +149,13 @@ export function recordFinalizeEnqueue(params: {
 export function recordFinalizeJobResult(params: {
   outcome: "success" | "failed" | "retry_lock";
   reason?: string;
+  retryable?: boolean;
   durationMs: number;
 }) {
   incrementCounter("floe_finalize_jobs_total", 1, {
     outcome: params.outcome,
     reason: params.reason ?? "none",
+    retryable: params.retryable ?? false,
   });
   observeHistogram(
     "floe_finalize_job_duration_ms",
@@ -162,6 +164,34 @@ export function recordFinalizeJobResult(params: {
     {
       outcome: params.outcome,
     }
+  );
+}
+
+export function observeFinalizeStage(params: {
+  stage: string;
+  outcome: "success" | "failure";
+  durationMs: number;
+}) {
+  incrementCounter("floe_finalize_stage_total", 1, {
+    stage: params.stage,
+    outcome: params.outcome,
+  });
+  observeHistogram(
+    "floe_finalize_stage_duration_ms",
+    params.durationMs,
+    FINALIZE_DURATION_BUCKETS_MS,
+    {
+      stage: params.stage,
+      outcome: params.outcome,
+    }
+  );
+}
+
+export function observeFinalizeQueueWait(durationMs: number) {
+  observeHistogram(
+    "floe_finalize_queue_wait_ms",
+    durationMs,
+    FINALIZE_DURATION_BUCKETS_MS
   );
 }
 
@@ -344,6 +374,18 @@ export function renderPrometheusMetrics(): string {
     ...renderHistogram(
       "floe_finalize_job_duration_ms",
       "Finalize job duration in milliseconds"
+    ),
+    ...renderCounter(
+      "floe_finalize_stage_total",
+      "Finalize stage outcomes by stage"
+    ),
+    ...renderHistogram(
+      "floe_finalize_stage_duration_ms",
+      "Finalize stage duration in milliseconds"
+    ),
+    ...renderHistogram(
+      "floe_finalize_queue_wait_ms",
+      "Finalize queue wait duration in milliseconds"
     ),
     ...renderCounter("floe_walrus_publish_total", "Walrus publish outcomes"),
     ...renderHistogram(

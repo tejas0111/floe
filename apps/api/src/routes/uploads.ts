@@ -495,6 +495,20 @@ export default async function uploadRoutes(app: FastifyInstance) {
         ...(exposeBlobId && meta?.blobId ? { blobId: meta.blobId } : {}),
         ...(meta?.walrusEndEpoch ? { walrusEndEpoch: Number(meta.walrusEndEpoch) } : {}),
         ...(meta?.error ? { error: meta.error } : {}),
+        ...(meta?.finalizeStage ? { finalizeStage: meta.finalizeStage } : {}),
+        ...(meta?.finalizeLastSuccessfulStage
+          ? { finalizeLastSuccessfulStage: meta.finalizeLastSuccessfulStage }
+          : {}),
+        ...(meta?.failedStage ? { failedStage: meta.failedStage } : {}),
+        ...(meta?.failedReasonCode ? { failedReasonCode: meta.failedReasonCode } : {}),
+        ...(meta?.failedRetryable
+          ? { failedRetryable: meta.failedRetryable === "1" }
+          : {}),
+        ...(meta?.finalizeAttempts ? { finalizeAttempts: Number(meta.finalizeAttempts) } : {}),
+        ...(meta?.finalizeQueueWaitMs
+          ? { finalizeQueueWaitMs: Number(meta.finalizeQueueWaitMs) }
+          : {}),
+        ...(meta?.finalizeTotalMs ? { finalizeTotalMs: Number(meta.finalizeTotalMs) } : {}),
       };
     }
     const authzStatus = await req.server.authProvider.authorizeUploadAccess({
@@ -527,6 +541,18 @@ export default async function uploadRoutes(app: FastifyInstance) {
       ...(exposeBlobId && meta?.blobId ? { blobId: meta.blobId } : {}),
       ...(meta?.walrusEndEpoch ? { walrusEndEpoch: Number(meta.walrusEndEpoch) } : {}),
       ...(meta?.error ? { error: meta.error } : {}),
+      ...(meta?.finalizeStage ? { finalizeStage: meta.finalizeStage } : {}),
+      ...(meta?.finalizeLastSuccessfulStage
+        ? { finalizeLastSuccessfulStage: meta.finalizeLastSuccessfulStage }
+        : {}),
+      ...(meta?.failedStage ? { failedStage: meta.failedStage } : {}),
+      ...(meta?.failedReasonCode ? { failedReasonCode: meta.failedReasonCode } : {}),
+      ...(meta?.failedRetryable ? { failedRetryable: meta.failedRetryable === "1" } : {}),
+      ...(meta?.finalizeAttempts ? { finalizeAttempts: Number(meta.finalizeAttempts) } : {}),
+      ...(meta?.finalizeQueueWaitMs
+        ? { finalizeQueueWaitMs: Number(meta.finalizeQueueWaitMs) }
+        : {}),
+      ...(meta?.finalizeTotalMs ? { finalizeTotalMs: Number(meta.finalizeTotalMs) } : {}),
     };
   });
 
