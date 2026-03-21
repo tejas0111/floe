@@ -491,6 +491,11 @@ export default async function uploadRoutes(app: FastifyInstance) {
         ...(meta?.finalizeQueueWaitMs
           ? { finalizeQueueWaitMs: Number(meta.finalizeQueueWaitMs) }
           : {}),
+        ...(meta?.finalizeVerifyMs ? { finalizeVerifyMs: Number(meta.finalizeVerifyMs) } : {}),
+        ...(meta?.finalizeWalrusMs ? { finalizeWalrusMs: Number(meta.finalizeWalrusMs) } : {}),
+        ...(meta?.finalizeSuiMs ? { finalizeSuiMs: Number(meta.finalizeSuiMs) } : {}),
+        ...(meta?.finalizeRedisMs ? { finalizeRedisMs: Number(meta.finalizeRedisMs) } : {}),
+        ...(meta?.finalizeCleanupMs ? { finalizeCleanupMs: Number(meta.finalizeCleanupMs) } : {}),
         ...(meta?.finalizeTotalMs ? { finalizeTotalMs: Number(meta.finalizeTotalMs) } : {}),
       };
     }
