@@ -18,6 +18,10 @@ import { applyRateLimitHeaders } from "../services/auth/auth.headers.js";
 import { chunkStore } from "../store/index.js";
 import { getRedis } from "../state/redis.js";
 import { uploadKeys } from "../state/keys.js";
+import {
+  observeChunkUpload,
+  recordUploadLifecycle,
+} from "../services/metrics/runtime.metrics.js";
 
 function isUuid(value: unknown): value is string {
   return (
@@ -62,6 +66,10 @@ const DEFAULT_OWNER_ADDRESS = parseOptionalSuiAddressEnv("FLOE_DEFAULT_OWNER_ADD
 
 const FINALIZE_POLL_AFTER_MS = parsePositiveIntEnv("FLOE_FINALIZE_STATUS_POLL_MS", 2000);
 
+function authTierLabel(authenticated: boolean): "authenticated" | "public" {
+  return authenticated ? "authenticated" : "public";
+}
+
 async function tryReserveUploadCapacity(params: {
   maxActiveUploads: number;
   uploadId: string;
@@ -91,13 +99,17 @@ async function tryReserveUploadCapacity(params: {
 export default async function uploadRoutes(app: FastifyInstance) {
   app.post("/v1/uploads/create", async (req, reply) => {
     const log = req.log;
+    const requestId = req.id;
     const body = req.body as any;
+    const createStartedAt = Date.now();
     const createLimit = await req.server.authProvider.checkRateLimit({
       req,
       scope: "upload_control",
     });
     applyRateLimitHeaders(reply, createLimit);
+    const createAuth = authTierLabel(createLimit.identity.authenticated);
     if (!createLimit.allowed) {
+      recordUploadLifecycle({ action: "create", outcome: "rate_limited", auth: createAuth, durationMs: Date.now() - createStartedAt });
       return sendApiError(reply, 429, "RATE_LIMITED", "Rate limit exceeded", {
         retryable: true,
         details: {
@@ -243,7 +255,8 @@ export default async function uploadRoutes(app: FastifyInstance) {
       });
       sessionCreated = true;
 
-      log.info({ uploadId, totalChunks }, "Upload session created");
+      recordUploadLifecycle({ action: "create", outcome: "success", auth: createAuth, durationMs: Date.now() - createStartedAt });
+      log.info({ requestId, uploadId, totalChunks, owner: session.owner ?? null, auth: createAuth }, "Upload session created");
 
       return reply.code(201).send({
         uploadId: session.uploadId,
@@ -253,7 +266,8 @@ export default async function uploadRoutes(app: FastifyInstance) {
         expiresAt: session.expiresAt,
       });
     } catch (err) {
-      log.error({ err }, "Session creation failed");
+      recordUploadLifecycle({ action: "create", outcome: "failed", auth: createAuth, durationMs: Date.now() - createStartedAt });
+      log.error({ requestId, err, auth: createAuth }, "Session creation failed");
       return sendApiError(
         reply,
         500,
@@ -279,13 +293,17 @@ export default async function uploadRoutes(app: FastifyInstance) {
 
   app.put("/v1/uploads/:uploadId/chunk/:index", async (req, reply) => {
     const log = req.log;
+    const requestId = req.id;
     const { uploadId, index } = req.params as any;
+    const chunkStartedAt = Date.now();
     const chunkLimit = await req.server.authProvider.checkRateLimit({
       req,
       scope: "upload_chunk",
     });
     applyRateLimitHeaders(reply, chunkLimit);
+    const chunkAuth = authTierLabel(chunkLimit.identity.authenticated);
     if (!chunkLimit.allowed) {
+      recordUploadLifecycle({ action: "chunk", outcome: "rate_limited", auth: chunkAuth, durationMs: Date.now() - chunkStartedAt });
       return sendApiError(reply, 429, "RATE_LIMITED", "Rate limit exceeded", {
         retryable: true,
         details: {
@@ -371,12 +389,18 @@ export default async function uploadRoutes(app: FastifyInstance) {
       const redis = getRedis();
       await redis.sadd(uploadKeys.chunks(uploadId), String(idx));
 
+      recordUploadLifecycle({ action: "chunk", outcome: "success", auth: chunkAuth, durationMs: Date.now() - chunkStartedAt });
+      observeChunkUpload({ outcome: "success", durationMs: Date.now() - chunkStartedAt });
+      log.info({ requestId, uploadId, idx, auth: chunkAuth }, "Chunk uploaded");
+
       return { ok: true, chunkIndex: idx };
     } catch (err: any) {
       const message = err?.message ?? "Chunk upload failed";
 
       if (err?.message === "CHUNK_IN_PROGRESS") {
-        log.info({ uploadId, idx }, "Chunk upload already in progress");
+        recordUploadLifecycle({ action: "chunk", outcome: "duplicate", auth: chunkAuth, durationMs: Date.now() - chunkStartedAt });
+        observeChunkUpload({ outcome: "duplicate", durationMs: Date.now() - chunkStartedAt });
+        log.info({ requestId, uploadId, idx, auth: chunkAuth }, "Chunk upload already in progress");
         return sendApiError(
           reply,
           409,
@@ -397,7 +421,9 @@ export default async function uploadRoutes(app: FastifyInstance) {
         });
       }
 
-      log.warn({ uploadId, idx, err }, "Chunk upload failed");
+      recordUploadLifecycle({ action: "chunk", outcome: "failed", auth: chunkAuth, durationMs: Date.now() - chunkStartedAt });
+      observeChunkUpload({ outcome: "failed", durationMs: Date.now() - chunkStartedAt });
+      log.warn({ requestId, uploadId, idx, auth: chunkAuth, err }, "Chunk upload failed");
       return sendApiError(
         reply,
         500,
@@ -410,6 +436,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
 
   app.get("/v1/uploads/:uploadId/status", async (req, reply) => {
     const { uploadId } = req.params as { uploadId: string };
+    const statusStartedAt = Date.now();
     const exposeBlobId = shouldExposeBlobId((req as any).query);
 
     if (!isUuid(uploadId)) {
@@ -424,7 +451,9 @@ export default async function uploadRoutes(app: FastifyInstance) {
       scope: statusScope,
     });
     applyRateLimitHeaders(reply, statusLimit);
+    const statusAuth = authTierLabel(statusLimit.identity.authenticated);
     if (!statusLimit.allowed) {
+      recordUploadLifecycle({ action: "status", outcome: "rate_limited", auth: statusAuth, durationMs: Date.now() - statusStartedAt });
       return sendApiError(reply, 429, "RATE_LIMITED", "Rate limit exceeded", {
         retryable: true,
         details: {
@@ -448,6 +477,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
     if (!session) {
       const status = meta?.status;
       if (!status) {
+        recordUploadLifecycle({ action: "status", outcome: "not_found", auth: statusAuth, durationMs: Date.now() - statusStartedAt });
         return sendApiError(reply, 404, "UPLOAD_NOT_FOUND", "Invalid uploadId");
       }
       const authzStatus = await req.server.authProvider.authorizeUploadAccess({
@@ -465,6 +495,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
         );
       }
 
+      recordUploadLifecycle({ action: "status", outcome: "success", auth: statusAuth, durationMs: Date.now() - statusStartedAt });
       return {
         uploadId,
         chunkSize: meta?.chunkSize ? Number(meta.chunkSize) : null,
@@ -495,6 +526,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
       );
     }
 
+    recordUploadLifecycle({ action: "status", outcome: "success", auth: statusAuth, durationMs: Date.now() - statusStartedAt });
     return {
       uploadId,
       chunkSize: session.chunkSize,
@@ -515,14 +547,18 @@ export default async function uploadRoutes(app: FastifyInstance) {
 
   app.post("/v1/uploads/:uploadId/complete", async (req, reply) => {
     const log = req.log;
+    const requestId = req.id;
     const { uploadId } = req.params as { uploadId: string };
+    const completeStartedAt = Date.now();
     const exposeBlobId = shouldExposeBlobId((req as any).query);
     const completeLimit = await req.server.authProvider.checkRateLimit({
       req,
       scope: "upload_control",
     });
     applyRateLimitHeaders(reply, completeLimit);
+    const completeAuth = authTierLabel(completeLimit.identity.authenticated);
     if (!completeLimit.allowed) {
+      recordUploadLifecycle({ action: "complete", outcome: "rate_limited", auth: completeAuth, durationMs: Date.now() - completeStartedAt });
       return sendApiError(reply, 429, "RATE_LIMITED", "Rate limit exceeded", {
         retryable: true,
         details: {
@@ -628,6 +664,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
 
     const queued = await enqueueUploadFinalize({ uploadId, log });
     if (queued.rejectedByBackpressure) {
+      recordUploadLifecycle({ action: "complete", outcome: "backpressure", auth: completeAuth, durationMs: Date.now() - completeStartedAt });
       return sendApiError(
         reply,
         503,
@@ -636,6 +673,8 @@ export default async function uploadRoutes(app: FastifyInstance) {
         { retryable: true }
       );
     }
+    recordUploadLifecycle({ action: "complete", outcome: queued.enqueued ? "queued" : "duplicate", auth: completeAuth, durationMs: Date.now() - completeStartedAt });
+    log.info({ requestId, uploadId, auth: completeAuth, enqueued: queued.enqueued }, "Upload finalize requested");
     reply.header("Retry-After", String(Math.max(1, Math.ceil(FINALIZE_POLL_AFTER_MS / 1000))));
     return reply.code(202).send({
       uploadId,
@@ -648,13 +687,17 @@ export default async function uploadRoutes(app: FastifyInstance) {
 
   app.delete("/v1/uploads/:uploadId", async (req, reply) => {
     const log = req.log;
+    const requestId = req.id;
     const { uploadId } = req.params as { uploadId: string };
+    const cancelStartedAt = Date.now();
     const cancelLimit = await req.server.authProvider.checkRateLimit({
       req,
       scope: "upload_control",
     });
     applyRateLimitHeaders(reply, cancelLimit);
+    const cancelAuth = authTierLabel(cancelLimit.identity.authenticated);
     if (!cancelLimit.allowed) {
+      recordUploadLifecycle({ action: "cancel", outcome: "rate_limited", auth: cancelAuth, durationMs: Date.now() - cancelStartedAt });
       return sendApiError(reply, 429, "RATE_LIMITED", "Rate limit exceeded", {
         retryable: true,
         details: {
@@ -722,6 +765,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
 
       if (status === "canceled" || status === "failed" || status === "expired") {
         await redis.srem(uploadKeys.gcIndex(), uploadId);
+        recordUploadLifecycle({ action: "cancel", outcome: status, auth: cancelAuth, durationMs: Date.now() - cancelStartedAt });
         return reply.code(200).send({ ok: true, uploadId, status });
       }
 
@@ -742,7 +786,8 @@ export default async function uploadRoutes(app: FastifyInstance) {
         .srem(uploadKeys.gcIndex(), uploadId)
         .exec();
 
-      log.info({ uploadId }, "Upload canceled");
+      recordUploadLifecycle({ action: "cancel", outcome: "canceled", auth: cancelAuth, durationMs: Date.now() - cancelStartedAt });
+      log.info({ requestId, uploadId, auth: cancelAuth }, "Upload canceled");
       return reply.code(200).send({ ok: true, uploadId, status: "canceled" });
     }
 
@@ -772,7 +817,8 @@ export default async function uploadRoutes(app: FastifyInstance) {
       .srem(uploadKeys.gcIndex(), uploadId)
       .exec();
 
-    log.info({ uploadId }, "Upload canceled");
+    recordUploadLifecycle({ action: "cancel", outcome: "canceled", auth: cancelAuth, durationMs: Date.now() - cancelStartedAt });
+    log.info({ requestId, uploadId, auth: cancelAuth }, "Upload canceled");
     return reply.code(200).send({ ok: true, uploadId, status: "canceled" });
   });
 

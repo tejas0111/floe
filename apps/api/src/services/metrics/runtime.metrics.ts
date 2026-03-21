@@ -109,6 +109,7 @@ const FINALIZE_DURATION_BUCKETS_MS = [
 ];
 const UPSTREAM_DURATION_BUCKETS_MS = [50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000];
 const LOOKUP_DURATION_BUCKETS_MS = [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500];
+const UPLOAD_DURATION_BUCKETS_MS = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000];
 
 export function recordHttpRequest(params: {
   method: string;
@@ -127,6 +128,43 @@ export function recordHttpRequest(params: {
     params.durationMs,
     HTTP_DURATION_BUCKETS_MS,
     labels
+  );
+}
+
+export function recordUploadLifecycle(params: {
+  action: "create" | "chunk" | "status" | "complete" | "cancel";
+  outcome: string;
+  auth: "authenticated" | "public";
+  durationMs?: number;
+}) {
+  incrementCounter("floe_upload_lifecycle_total", 1, {
+    action: params.action,
+    outcome: params.outcome,
+    auth: params.auth,
+  });
+  if (Number.isFinite(params.durationMs)) {
+    observeHistogram(
+      "floe_upload_lifecycle_duration_ms",
+      Number(params.durationMs),
+      UPLOAD_DURATION_BUCKETS_MS,
+      {
+        action: params.action,
+        outcome: params.outcome,
+      }
+    );
+  }
+}
+
+export function observeChunkUpload(params: {
+  outcome: "success" | "failed" | "duplicate";
+  durationMs: number;
+}) {
+  incrementCounter("floe_chunk_upload_total", 1, { outcome: params.outcome });
+  observeHistogram(
+    "floe_chunk_upload_duration_ms",
+    params.durationMs,
+    UPLOAD_DURATION_BUCKETS_MS,
+    { outcome: params.outcome }
   );
 }
 
@@ -330,6 +368,10 @@ export function renderPrometheusMetrics(): string {
       "floe_http_request_duration_ms",
       "HTTP request duration in milliseconds"
     ),
+    ...renderCounter("floe_upload_lifecycle_total", "Upload lifecycle events by action, outcome, and auth tier"),
+    ...renderHistogram("floe_upload_lifecycle_duration_ms", "Upload lifecycle duration in milliseconds"),
+    ...renderCounter("floe_chunk_upload_total", "Chunk upload outcomes"),
+    ...renderHistogram("floe_chunk_upload_duration_ms", "Chunk upload duration in milliseconds"),
     ...renderGauge("floe_finalize_queue_depth", "Current finalize queue depth"),
     ...renderGauge(
       "floe_finalize_queue_pending_unique",

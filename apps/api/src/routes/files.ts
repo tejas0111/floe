@@ -406,7 +406,7 @@ export async function filesRoutes(app: FastifyInstance) {
       fields = out.fields;
       fieldsSource = out.source;
     } catch (err) {
-      req.log.error({ err, fileId }, "Sui read failed");
+      req.log.error({ requestId: req.id, err, fileId }, "Sui read failed");
       return sendApiError(
         res,
         503,
@@ -417,12 +417,13 @@ export async function filesRoutes(app: FastifyInstance) {
     }
 
     if (!fields) {
+      req.log.info({ requestId: req.id, fileId }, "File metadata not found");
       return sendApiError(res, 404, "FILE_NOT_FOUND", "File not found");
     }
 
     const normalized = normalizeFileFields(fields);
     if (!normalized) {
-      req.log.error({ fileId, fields }, "Invalid file metadata fields");
+      req.log.error({ requestId: req.id, fileId, fields }, "Invalid file metadata fields");
       return sendApiError(
         res,
         502,
@@ -495,7 +496,7 @@ export async function filesRoutes(app: FastifyInstance) {
       fields = out.fields;
       fieldsSource = out.source;
     } catch (err) {
-      req.log.error({ err, fileId }, "Sui read failed");
+      req.log.error({ requestId: req.id, err, fileId }, "Sui read failed");
       return sendApiError(
         res,
         503,
@@ -506,12 +507,13 @@ export async function filesRoutes(app: FastifyInstance) {
     }
 
     if (!fields) {
+      req.log.info({ requestId: req.id, fileId }, "File manifest target not found");
       return sendApiError(res, 404, "FILE_NOT_FOUND", "File not found");
     }
 
     const normalized = normalizeFileFields(fields);
     if (!normalized) {
-      req.log.error({ fileId, fields }, "Invalid file metadata fields");
+      req.log.error({ requestId: req.id, fileId, fields }, "Invalid file metadata fields");
       return sendApiError(
         res,
         502,
@@ -596,7 +598,7 @@ export async function filesRoutes(app: FastifyInstance) {
         fields = out.fields;
         fieldsSource = out.source;
       } catch (err) {
-        req.log.error({ err, fileId }, "Sui read failed");
+        req.log.error({ requestId: req.id, err, fileId }, "Sui read failed");
         return sendApiError(
           reply,
           503,
@@ -607,12 +609,13 @@ export async function filesRoutes(app: FastifyInstance) {
       }
 
       if (!fields) {
+        req.log.info({ requestId: req.id, fileId }, "File stream target not found");
         return sendApiError(reply, 404, "FILE_NOT_FOUND", "File not found");
       }
 
       const normalized = normalizeFileFields(fields);
       if (!normalized) {
-        req.log.error({ fileId, fields }, "Invalid file metadata fields");
+        req.log.error({ requestId: req.id, fileId, fields }, "Invalid file metadata fields");
         return sendApiError(
           reply,
           502,
@@ -668,6 +671,7 @@ export async function filesRoutes(app: FastifyInstance) {
         });
 
         if ("error" in parsedOrErr) {
+          req.log.warn({ requestId: req.id, fileId, rangeHeader }, "Invalid stream range requested");
           reply.header("Content-Range", `bytes */${sizeBytes}`);
           return sendApiError(
             reply,
@@ -737,7 +741,12 @@ export async function filesRoutes(app: FastifyInstance) {
         if (err?.message === "FILE_CONTENT_NOT_FOUND") {
           err.message = "FILE_BLOB_UNAVAILABLE";
         }
-        recordStreamReadError(classifyStreamErrorReason(String(err?.message ?? "")));
+        const reason = classifyStreamErrorReason(String(err?.message ?? ""));
+        recordStreamReadError(reason);
+        req.log.warn(
+          { requestId: req.id, fileId, blobId, range: rangeHeader ? "partial" : "full", reason, err },
+          "File stream failed"
+        );
       });
 
       return reply.status(status).send(stream);
