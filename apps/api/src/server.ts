@@ -8,19 +8,17 @@ import path from "path";
 import uploadRoutes from "./routes/uploads.js";
 import healthRoute from "./routes/health.js";
 import { filesRoutes } from "./routes/files.js";
-import { initRedis } from "./state/redis.js";
+import { initRedis, isRedisUnavailableError } from "./state/redis.js";
 import {
   closePostgres,
   initPostgres,
   isPostgresConfigured,
+  isPostgresUnavailableError,
 } from "./state/postgres.js";
 import { initS3IfEnabled } from "./state/s3.js";
 import { startUploadGc, stopUploadGc } from "./state/gc/upload.gc.scheduler.js";
-import { reconcileOrphanUploads } from "./state/gc/upload.gc.reconcile.js";
-import {
-  startUploadFinalizeWorker,
-  stopUploadFinalizeWorker,
-} from "./services/uploads/finalize.queue.js";
+import { stopUploadFinalizeWorker } from "./services/uploads/finalize.queue.js";
+import { runStartupRecovery } from "./services/startup/recovery.js";
 import { ChunkConfig, UploadConfig } from "./config/uploads.config.js";
 import {
   createDefaultAuthProvider,
@@ -174,8 +172,7 @@ export async function createApiServer(params?: { authProvider?: AuthProvider }) 
     throw err;
   }
 
-  await reconcileOrphanUploads(app.log);
-  await startUploadFinalizeWorker(app.log);
+  await runStartupRecovery(app.log);
   startUploadGc(app.log);
 
   await app.register(uploadRoutes);
@@ -183,30 +180,41 @@ export async function createApiServer(params?: { authProvider?: AuthProvider }) 
   await app.register(healthRoute);
 
   app.setErrorHandler((err, req, reply) => {
+    const dependencyUnavailable =
+      isRedisUnavailableError(err) || isPostgresUnavailableError(err);
     const statusCode =
-      (err as any)?.statusCode && Number.isInteger((err as any).statusCode)
-        ? (err as any).statusCode
-        : 500;
+      dependencyUnavailable
+        ? 503
+        : (err as any)?.statusCode && Number.isInteger((err as any).statusCode)
+          ? (err as any).statusCode
+          : 500;
     const knownCodeByMessage: Record<string, string> = {
       FILE_BLOB_UNAVAILABLE: "FILE_BLOB_UNAVAILABLE",
       FILE_CONTENT_NOT_FOUND: "FILE_BLOB_UNAVAILABLE",
     };
+    const dependencyCode = isRedisUnavailableError(err)
+      ? "REDIS_UNAVAILABLE"
+      : isPostgresUnavailableError(err)
+        ? "POSTGRES_UNAVAILABLE"
+        : undefined;
     const knownCode = err instanceof Error ? knownCodeByMessage[err.message] : undefined;
 
     req.log.error(
-      { err, url: req.url, method: req.method, requestId: req.id },
+      { err, url: req.url, method: req.method, requestId: req.id, dependencyUnavailable },
       "Request error"
     );
 
     return reply.code(statusCode).send({
       error: {
-        code: knownCode ?? (statusCode < 500 ? "REQUEST_ERROR" : "INTERNAL_ERROR"),
+        code:
+          dependencyCode ?? knownCode ?? (statusCode < 500 ? "REQUEST_ERROR" : "INTERNAL_ERROR"),
         message:
-          statusCode < 500 && err instanceof Error
-            ? err.message
-            : "Unexpected server error",
-
-        retryable: false,
+          dependencyUnavailable
+            ? "A required dependency is currently unavailable"
+            : statusCode < 500 && err instanceof Error
+              ? err.message
+              : "Unexpected server error",
+        retryable: dependencyUnavailable,
       },
     });
   });

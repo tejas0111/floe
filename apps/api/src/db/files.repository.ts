@@ -1,4 +1,4 @@
-import { getPostgres } from "../state/postgres.js";
+import { getPostgres, notePostgresFailure } from "../state/postgres.js";
 
 export type IndexedFileRecord = {
   fileId: string;
@@ -12,82 +12,99 @@ export type IndexedFileRecord = {
 
 export async function ensureFilesTable(): Promise<void> {
   const pg = getPostgres();
-  if (!pg) return;
-  await pg.query(`
-    create table if not exists floe_files (
-      file_id text primary key,
-      blob_id text not null,
-      owner_address text null,
-      size_bytes bigint not null,
-      mime_type text not null,
-      walrus_end_epoch bigint null,
-      created_at_ms bigint not null,
-      created_at timestamptz not null default now(),
-      updated_at timestamptz not null default now()
-    );
-  `);
+  if (pg === null) return;
 
-  await pg.query(`
-    create index if not exists floe_files_owner_created_idx
-    on floe_files (owner_address, created_at desc);
-  `);
+  try {
+    await pg.query(`
+      create table if not exists floe_files (
+        file_id text primary key,
+        blob_id text not null,
+        owner_address text null,
+        size_bytes bigint not null,
+        mime_type text not null,
+        walrus_end_epoch bigint null,
+        created_at_ms bigint not null,
+        created_at timestamptz not null default now(),
+        updated_at timestamptz not null default now()
+      );
+    `);
+
+    await pg.query(`
+      create index if not exists floe_files_owner_created_idx
+      on floe_files (owner_address, created_at desc);
+    `);
+  } catch (err) {
+    notePostgresFailure(err);
+    throw err;
+  }
 }
 
 export async function upsertIndexedFile(record: IndexedFileRecord): Promise<void> {
   const pg = getPostgres();
-  if (!pg) return;
+  if (pg === null) return;
 
-  await pg.query(
-    `
-      insert into floe_files (
-        file_id, blob_id, owner_address, size_bytes, mime_type, walrus_end_epoch, created_at_ms, updated_at
-      ) values ($1, $2, $3, $4, $5, $6, $7, now())
-      on conflict (file_id) do update set
-        blob_id = excluded.blob_id,
-        owner_address = excluded.owner_address,
-        size_bytes = excluded.size_bytes,
-        mime_type = excluded.mime_type,
-        walrus_end_epoch = excluded.walrus_end_epoch,
-        created_at_ms = excluded.created_at_ms,
-        updated_at = now()
-    `,
-    [
-      record.fileId,
-      record.blobId,
-      record.ownerAddress,
-      Math.trunc(record.sizeBytes),
-      record.mimeType,
-      record.walrusEndEpoch,
-      Math.trunc(record.createdAtMs),
-    ]
-  );
+  try {
+    await pg.query(
+      `
+        insert into floe_files (
+          file_id, blob_id, owner_address, size_bytes, mime_type, walrus_end_epoch, created_at_ms, updated_at
+        ) values ($1, $2, $3, $4, $5, $6, $7, now())
+        on conflict (file_id) do update set
+          blob_id = excluded.blob_id,
+          owner_address = excluded.owner_address,
+          size_bytes = excluded.size_bytes,
+          mime_type = excluded.mime_type,
+          walrus_end_epoch = excluded.walrus_end_epoch,
+          created_at_ms = excluded.created_at_ms,
+          updated_at = now()
+      `,
+      [
+        record.fileId,
+        record.blobId,
+        record.ownerAddress,
+        Math.trunc(record.sizeBytes),
+        record.mimeType,
+        record.walrusEndEpoch,
+        Math.trunc(record.createdAtMs),
+      ]
+    );
+  } catch (err) {
+    notePostgresFailure(err);
+    throw err;
+  }
 }
 
 export async function getIndexedFile(
   fileId: string
 ): Promise<IndexedFileRecord | null> {
   const pg = getPostgres();
-  if (!pg) return null;
+  if (pg === null) return null;
 
-  const out = await pg.query(
-    `
-      select
-        file_id,
-        blob_id,
-        owner_address,
-        size_bytes,
-        mime_type,
-        walrus_end_epoch,
-        created_at_ms
-      from floe_files
-      where file_id = $1
-      limit 1
-    `,
-    [fileId]
-  );
+  let out;
+  try {
+    out = await pg.query(
+      `
+        select
+          file_id,
+          blob_id,
+          owner_address,
+          size_bytes,
+          mime_type,
+          walrus_end_epoch,
+          created_at_ms
+        from floe_files
+        where file_id = $1
+        limit 1
+      `,
+      [fileId]
+    );
+  } catch (err) {
+    notePostgresFailure(err);
+    throw err;
+  }
 
   const row = out.rows[0];
-  if (!row) return null;
+  if (row === undefined || row === null) return null;
 
   return {
     fileId: String(row.file_id),
