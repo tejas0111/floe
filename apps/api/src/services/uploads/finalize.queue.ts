@@ -304,20 +304,41 @@ async function runFinalizeJob(uploadId: string, log: FastifyBaseLogger) {
   });
 
   try {
-    timeoutHandle = setTimeout(() => {
-      timedOut = true;
-      log.error(
-        {
-          uploadId,
-          elapsedMs: Date.now() - startedAt,
-          timeoutMs: FINALIZE_TIMEOUT_MS,
-        },
-        "Upload finalize worker exceeded timeout; keeping job active until finalize settles"
-      );
-    }, FINALIZE_TIMEOUT_MS);
-    timeoutHandle.unref?.();
+    const processPromise = processFinalizeImpl({ uploadId, log, attempt, queueWaitMs });
+    void processPromise.then(
+      () => {
+        if (timedOut) {
+          log.warn({ uploadId }, "Upload finalize settled after timeout recovery");
+        }
+      },
+      (lateErr) => {
+        if (timedOut) {
+          log.warn({ uploadId, err: lateErr }, "Upload finalize rejected after timeout recovery");
+        }
+      }
+    );
 
-    await processFinalizeImpl({ uploadId, log, attempt, queueWaitMs });
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutHandle = setTimeout(() => {
+        timedOut = true;
+        log.error(
+          {
+            uploadId,
+            elapsedMs: Date.now() - startedAt,
+            timeoutMs: FINALIZE_TIMEOUT_MS,
+          },
+          "Upload finalize worker exceeded timeout; forcing retry recovery"
+        );
+        const timeoutErr = new Error("UPLOAD_FINALIZE_TIMEOUT") as Error & {
+          finalizeStage?: string;
+        };
+        timeoutErr.finalizeStage = "timeout";
+        reject(timeoutErr);
+      }, FINALIZE_TIMEOUT_MS);
+      timeoutHandle.unref?.();
+    });
+
+    await Promise.race([processPromise, timeoutPromise]);
     log.info({ uploadId, attempt, queueWaitMs }, "Upload finalize worker completed");
     await clearPending(uploadId);
     recordFinalizeJobResult({
@@ -444,10 +465,15 @@ async function recoverFinalizingUploads(log: FastifyBaseLogger) {
   if (!Array.isArray(activeIds) || activeIds.length === 0) return;
 
   const entries = await Promise.all(
-    activeIds.map(async (uploadId) => ({
-      uploadId,
-      status: await redis.hget<string>(uploadKeys.meta(uploadId), "status"),
-    }))
+    activeIds.map(async (uploadId) => {
+      const meta = await redis.hgetall<Record<string, string>>(uploadKeys.meta(uploadId));
+      return {
+        uploadId,
+        status: meta?.status,
+        failedRetryable: meta?.failedRetryable,
+        finalizeAttemptState: meta?.finalizeAttemptState,
+      };
+    })
   );
   const recoveryPlan = planFinalizeRecoveryPass(entries);
 
@@ -582,5 +608,6 @@ export async function syncFinalizeQueueMetrics(): Promise<void> {
     depth: stats.depth,
     pendingUnique: stats.pendingUnique,
     activeLocal: stats.activeLocal,
+    oldestQueuedAgeMs: stats.oldestQueuedAgeMs ?? 0,
   });
 }

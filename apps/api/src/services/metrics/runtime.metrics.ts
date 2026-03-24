@@ -134,10 +134,12 @@ export function setFinalizeQueueMetrics(params: {
   depth: number;
   pendingUnique: number;
   activeLocal: number;
+  oldestQueuedAgeMs: number;
 }) {
   setGauge("floe_finalize_queue_depth", params.depth);
   setGauge("floe_finalize_queue_pending_unique", params.pendingUnique);
   setGauge("floe_finalize_workers_active", params.activeLocal);
+  setGauge("floe_finalize_queue_oldest_age_ms", params.oldestQueuedAgeMs);
 }
 
 export function recordFinalizeEnqueue(params: {
@@ -366,6 +368,7 @@ export function renderPrometheusMetrics(): string {
       "Unique uploads pending finalization"
     ),
     ...renderGauge("floe_finalize_workers_active", "Active finalize workers in this process"),
+    ...renderGauge("floe_finalize_queue_oldest_age_ms", "Oldest finalize queue age in milliseconds"),
     ...renderCounter(
       "floe_finalize_enqueue_total",
       "Finalize enqueue attempts by result"

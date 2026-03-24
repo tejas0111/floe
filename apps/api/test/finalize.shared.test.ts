@@ -211,11 +211,13 @@ test("buildCompletedFinalizeResult preserves idempotent finalize output", () => 
   );
 });
 
-test("classifyFinalizeRecoveryAction only requeues finalizing uploads on restart", () => {
-  assert.equal(classifyFinalizeRecoveryAction("finalizing"), "requeue");
-  assert.equal(classifyFinalizeRecoveryAction("completed"), "cleanup");
-  assert.equal(classifyFinalizeRecoveryAction("failed"), "cleanup");
-  assert.equal(classifyFinalizeRecoveryAction(undefined), "cleanup");
+test("classifyFinalizeRecoveryAction requeues finalizing and retryable-failed uploads on restart", () => {
+  assert.equal(classifyFinalizeRecoveryAction({ status: "finalizing" }), "requeue");
+  assert.equal(classifyFinalizeRecoveryAction({ status: "failed", failedRetryable: "1" }), "requeue");
+  assert.equal(classifyFinalizeRecoveryAction({ status: "failed", finalizeAttemptState: "retryable_failure" }), "requeue");
+  assert.equal(classifyFinalizeRecoveryAction({ status: "completed" }), "cleanup");
+  assert.equal(classifyFinalizeRecoveryAction({ status: "failed" }), "cleanup");
+  assert.equal(classifyFinalizeRecoveryAction({ status: undefined }), "cleanup");
 });
 
 
@@ -224,15 +226,15 @@ test("planFinalizeRecoveryPass batches restart recovery decisions across mixed u
     planFinalizeRecoveryPass([
       { uploadId: "u1", status: "finalizing" },
       { uploadId: "u2", status: "completed" },
-      { uploadId: "u3", status: "failed" },
+      { uploadId: "u3", status: "failed", failedRetryable: "1" },
       { uploadId: "u4", status: undefined },
       { uploadId: "u5", status: "finalizing" },
     ]),
     {
-      requeueIds: ["u1", "u5"],
-      cleanupIds: ["u2", "u3", "u4"],
-      recovered: 2,
-      cleaned: 3,
+      requeueIds: ["u1", "u3", "u5"],
+      cleanupIds: ["u2", "u4"],
+      recovered: 3,
+      cleaned: 2,
     }
   );
 });
@@ -429,11 +431,13 @@ test("retryable finalize failure helpers cap retries and record retry metadata",
       nowMs: 222,
     }),
     {
+      status: "finalizing",
       lastFinalizeRetryAt: "222",
       lastFinalizeRetryDelayMs: "4000",
       failedReasonCode: "walrus_unavailable",
       failedRetryable: "1",
       finalizeAttemptState: "retryable_failure",
+      finalizeLastProgressAt: "222",
       failedStage: "walrus_publish",
     }
   );
@@ -460,11 +464,13 @@ test("retryable finalize failure helpers cap retries and record retry metadata",
 
   assert.deepEqual(writes, [
     {
+      status: "finalizing",
       lastFinalizeRetryAt: "222",
       lastFinalizeRetryDelayMs: "4000",
       failedReasonCode: "walrus_unavailable",
       failedRetryable: "1",
       finalizeAttemptState: "retryable_failure",
+      finalizeLastProgressAt: "222",
       failedStage: "walrus_publish",
     },
   ]);
@@ -514,6 +520,29 @@ test("assessFinalizeQueueHealth marks stalled finalize backlog as degraded and n
       ready: false,
       backlogStalled: true,
       finalizeQueueWarning: "finalize queue oldest age 400000ms exceeds 300000ms",
+    }
+  );
+});
+
+
+test("assessFinalizeQueueHealth keeps active-only long finalize work ready", () => {
+  assert.deepEqual(
+    assessFinalizeQueueHealth({
+      ready: true,
+      finalizeQueue: {
+        depth: 1,
+        pendingUnique: 1,
+        activeLocal: 1,
+        concurrency: 4,
+        oldestQueuedAt: 100,
+        oldestQueuedAgeMs: 400000,
+      },
+      stuckAgeThresholdMs: 300000,
+    }),
+    {
+      ready: true,
+      backlogStalled: false,
+      finalizeQueueWarning: null,
     }
   );
 });

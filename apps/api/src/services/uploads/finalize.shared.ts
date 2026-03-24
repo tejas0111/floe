@@ -189,11 +189,13 @@ export function buildRetryableFinalizeFailureMeta(params: {
   stage?: string;
 }) {
   return {
+    status: "finalizing",
     lastFinalizeRetryAt: String(params.nowMs),
     lastFinalizeRetryDelayMs: String(params.delayMs),
     failedReasonCode: params.reason,
     failedRetryable: "1",
     finalizeAttemptState: "retryable_failure",
+    finalizeLastProgressAt: String(params.nowMs),
     ...(params.stage ? { failedStage: params.stage } : {}),
   };
 }
@@ -357,10 +359,12 @@ export function assessFinalizeQueueHealth(params: {
 }) {
   const oldestQueuedAgeMs = params.finalizeQueue?.oldestQueuedAgeMs ?? null;
   const pendingUnique = params.finalizeQueue?.pendingUnique ?? null;
+  const activeLocal = params.finalizeQueue?.activeLocal ?? null;
   const backlogStalled =
     oldestQueuedAgeMs !== null
     && pendingUnique !== null
-    && pendingUnique > 0
+    && activeLocal !== null
+    && pendingUnique > activeLocal
     && oldestQueuedAgeMs >= params.stuckAgeThresholdMs;
 
   return {
@@ -406,14 +410,26 @@ export function buildCompletedFinalizeResult(
   };
 }
 
-export function classifyFinalizeRecoveryAction(status: string | null | undefined):
+export function classifyFinalizeRecoveryAction(entry: {
+  status: string | null | undefined;
+  failedRetryable?: string | null | undefined;
+  finalizeAttemptState?: string | null | undefined;
+}):
   | "requeue"
   | "cleanup" {
-  return status === "finalizing" ? "requeue" : "cleanup";
+  if (entry.status === "finalizing") return "requeue";
+  if (entry.status === "failed" && entry.failedRetryable === "1") return "requeue";
+  if (entry.finalizeAttemptState === "retryable_failure") return "requeue";
+  return "cleanup";
 }
 
 export function planFinalizeRecoveryPass(
-  entries: Array<{ uploadId: string; status: string | null | undefined }>
+  entries: Array<{
+    uploadId: string;
+    status: string | null | undefined;
+    failedRetryable?: string | null | undefined;
+    finalizeAttemptState?: string | null | undefined;
+  }>
 ): {
   requeueIds: string[];
   cleanupIds: string[];
@@ -424,7 +440,7 @@ export function planFinalizeRecoveryPass(
   const cleanupIds: string[] = [];
 
   for (const entry of entries) {
-    if (classifyFinalizeRecoveryAction(entry.status) === "requeue") {
+    if (classifyFinalizeRecoveryAction(entry) === "requeue") {
       requeueIds.push(entry.uploadId);
       continue;
     }

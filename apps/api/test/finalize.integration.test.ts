@@ -21,6 +21,7 @@ process.env.FLOE_FINALIZE_RETRYABLE_FAILURE_BASE_MS = "200";
 process.env.FLOE_FINALIZE_RETRYABLE_FAILURE_MAX_MS = "1000";
 process.env.FLOE_FINALIZE_RETRYABLE_FAILURE_MAX_ATTEMPTS = "2";
 process.env.FLOE_FINALIZE_QUEUE_STUCK_AGE_MS = "1000";
+process.env.FLOE_FINALIZE_TIMEOUT_MS = "1000";
 process.env.WALRUS_AGGREGATOR_URL = "http://127.0.0.1:1";
 delete process.env.DATABASE_URL;
 
@@ -293,6 +294,7 @@ test("runFinalizeJob requeues retryable transient failures through the real work
     const meta = await redis.hgetall<Record<string, string>>(uploadKeys.meta(uploadId));
     const stats = await queueModule.getUploadFinalizeQueueStats();
 
+    assert.equal(meta.status, "finalizing");
     assert.equal(meta.failedReasonCode, "walrus_upload_failed");
     assert.equal(meta.failedRetryable, "1");
     assert.equal(meta.finalizeAttemptState, "retryable_failure");
@@ -364,6 +366,7 @@ test("runFinalizeJob requeues lock contention through the real worker path", asy
     const meta = await redis.hgetall<Record<string, string>>(uploadKeys.meta(uploadId));
     const stats = await queueModule.getUploadFinalizeQueueStats();
 
+    assert.equal(meta.status, "finalizing");
     assert.equal(meta.failedReasonCode, "lock_in_progress");
     assert.equal(meta.failedRetryable, "1");
     assert.equal(scheduled.length, 1);
@@ -397,6 +400,25 @@ test("runFinalizeJob treats already completed uploads idempotently on retry", as
     assert.equal(meta.fileId, "0xfile");
     assert.equal(stats.depth, 0);
     assert.equal(stats.pendingUnique, 0);
+  } finally {
+    await cleanupUpload(uploadId);
+  }
+});
+
+test("recoverFinalizingUploads also requeues retryable-failed uploads from pre-recovery state", async () => {
+  const uploadId = await seedUpload();
+  try {
+    const redis = redisModule.getRedis();
+    const { uploadKeys } = keysModule;
+    await redis.hset(uploadKeys.meta(uploadId), {
+      status: "failed",
+      failedRetryable: "1",
+      finalizeAttemptState: "retryable_failure",
+    });
+    await queueModule.finalizeQueueTestHooks.recoverFinalizingUploads(log);
+
+    const pendingIds = await redis.smembers<string[]>(uploadKeys.finalizePending());
+    assert.equal(pendingIds.includes(uploadId), true);
   } finally {
     await cleanupUpload(uploadId);
   }
@@ -480,6 +502,39 @@ test("upload status and complete routes expose finalize warnings and retry field
     assert.equal(completeBody.finalizeWarning, "post_commit_cleanup_failed");
     assert.equal(completeBody.finalizeAttemptState, "retryable_failure");
     assert.equal(completeBody.lastFinalizeRetryDelayMs, 5);
+  } finally {
+    await cleanupUpload(uploadId);
+  }
+});
+
+test("runFinalizeJob turns timeout into retryable recovery instead of holding the worker slot", async () => {
+  const uploadId = await seedUpload();
+  try {
+    await markUploadReadyForFinalize(uploadId);
+    await queueModule.finalizeQueueTestHooks.forceEnqueue(uploadId);
+
+    const scheduled: Array<{ uploadId: string; delayMs: number }> = [];
+    queueModule.finalizeQueueTestHooks.setProcessFinalize(async () => {
+      await sleep(1200);
+    });
+    queueModule.finalizeQueueTestHooks.setScheduleRetry(async (nextUploadId, _log, delayMs) => {
+      scheduled.push({ uploadId: nextUploadId, delayMs });
+    });
+
+    const startedAt = Date.now();
+    await queueModule.finalizeQueueTestHooks.runNextQueuedJob(log);
+    const elapsedMs = Date.now() - startedAt;
+
+    const redis = redisModule.getRedis();
+    const { uploadKeys } = keysModule;
+    const meta = await redis.hgetall<Record<string, string>>(uploadKeys.meta(uploadId));
+
+    assert.equal(elapsedMs < 1150, true);
+    assert.equal(meta.status, "finalizing");
+    assert.equal(meta.failedReasonCode, "timeout");
+    assert.equal(meta.failedRetryable, "1");
+    assert.equal(meta.finalizeAttemptState, "retryable_failure");
+    assert.equal(scheduled.length, 1);
   } finally {
     await cleanupUpload(uploadId);
   }
