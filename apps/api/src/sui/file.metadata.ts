@@ -40,13 +40,20 @@ export async function finalizeFileMetadata(
     ],
   });
 
-  const result = await suiClient.signAndExecuteTransaction({
-    transaction: tx,
-    signer: suiSigner,
-    options: {
-      showObjectChanges: true,
-    },
-  });
+  let result;
+  try {
+    result = await suiClient.signAndExecuteTransaction({
+      transaction: tx,
+      signer: suiSigner,
+      options: {
+        showObjectChanges: true,
+      },
+    });
+  } catch (err) {
+    throw new Error(
+      `SUI_FINALIZE_SUBMIT_FAILED:${(err as Error)?.message ?? "unknown"}`
+    );
+  }
 
   const created = result.objectChanges?.find(
     (c: any) => c.type === "created" && c.objectType?.includes("::file::FileMeta")

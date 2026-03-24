@@ -134,10 +134,12 @@ export function setFinalizeQueueMetrics(params: {
   depth: number;
   pendingUnique: number;
   activeLocal: number;
+  oldestQueuedAgeMs: number;
 }) {
   setGauge("floe_finalize_queue_depth", params.depth);
   setGauge("floe_finalize_queue_pending_unique", params.pendingUnique);
   setGauge("floe_finalize_workers_active", params.activeLocal);
+  setGauge("floe_finalize_queue_oldest_age_ms", params.oldestQueuedAgeMs);
 }
 
 export function recordFinalizeEnqueue(params: {
@@ -147,13 +149,15 @@ export function recordFinalizeEnqueue(params: {
 }
 
 export function recordFinalizeJobResult(params: {
-  outcome: "success" | "failed" | "retry_lock";
+  outcome: "success" | "failed" | "retry_lock" | "retry_transient";
   reason?: string;
+  retryable?: boolean;
   durationMs: number;
 }) {
   incrementCounter("floe_finalize_jobs_total", 1, {
     outcome: params.outcome,
     reason: params.reason ?? "none",
+    retryable: params.retryable ?? false,
   });
   observeHistogram(
     "floe_finalize_job_duration_ms",
@@ -162,6 +166,34 @@ export function recordFinalizeJobResult(params: {
     {
       outcome: params.outcome,
     }
+  );
+}
+
+export function observeFinalizeStage(params: {
+  stage: string;
+  outcome: "success" | "failure";
+  durationMs: number;
+}) {
+  incrementCounter("floe_finalize_stage_total", 1, {
+    stage: params.stage,
+    outcome: params.outcome,
+  });
+  observeHistogram(
+    "floe_finalize_stage_duration_ms",
+    params.durationMs,
+    FINALIZE_DURATION_BUCKETS_MS,
+    {
+      stage: params.stage,
+      outcome: params.outcome,
+    }
+  );
+}
+
+export function observeFinalizeQueueWait(durationMs: number) {
+  observeHistogram(
+    "floe_finalize_queue_wait_ms",
+    durationMs,
+    FINALIZE_DURATION_BUCKETS_MS
   );
 }
 
@@ -336,6 +368,7 @@ export function renderPrometheusMetrics(): string {
       "Unique uploads pending finalization"
     ),
     ...renderGauge("floe_finalize_workers_active", "Active finalize workers in this process"),
+    ...renderGauge("floe_finalize_queue_oldest_age_ms", "Oldest finalize queue age in milliseconds"),
     ...renderCounter(
       "floe_finalize_enqueue_total",
       "Finalize enqueue attempts by result"
@@ -344,6 +377,18 @@ export function renderPrometheusMetrics(): string {
     ...renderHistogram(
       "floe_finalize_job_duration_ms",
       "Finalize job duration in milliseconds"
+    ),
+    ...renderCounter(
+      "floe_finalize_stage_total",
+      "Finalize stage outcomes by stage"
+    ),
+    ...renderHistogram(
+      "floe_finalize_stage_duration_ms",
+      "Finalize stage duration in milliseconds"
+    ),
+    ...renderHistogram(
+      "floe_finalize_queue_wait_ms",
+      "Finalize queue wait duration in milliseconds"
     ),
     ...renderCounter("floe_walrus_publish_total", "Walrus publish outcomes"),
     ...renderHistogram(

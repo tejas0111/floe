@@ -9,6 +9,7 @@ import { WalrusEpochLimits } from "../config/walrus.config.js";
 import { AuthUploadPolicyConfig } from "../config/auth.config.js";
 
 import { createSession, getSession } from "../services/uploads/session.js";
+import { buildFinalizeDiagnostics } from "../services/uploads/finalize.shared.js";
 import {
   enqueueUploadFinalize,
   isUploadFinalizeQueued,
@@ -495,6 +496,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
         ...(exposeBlobId && meta?.blobId ? { blobId: meta.blobId } : {}),
         ...(meta?.walrusEndEpoch ? { walrusEndEpoch: Number(meta.walrusEndEpoch) } : {}),
         ...(meta?.error ? { error: meta.error } : {}),
+        ...buildFinalizeDiagnostics(meta),
       };
     }
     const authzStatus = await req.server.authProvider.authorizeUploadAccess({
@@ -527,6 +529,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
       ...(exposeBlobId && meta?.blobId ? { blobId: meta.blobId } : {}),
       ...(meta?.walrusEndEpoch ? { walrusEndEpoch: Number(meta.walrusEndEpoch) } : {}),
       ...(meta?.error ? { error: meta.error } : {}),
+      ...buildFinalizeDiagnostics(meta),
     };
   });
 
@@ -606,6 +609,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
           status: "finalizing",
           pollAfterMs: FINALIZE_POLL_AFTER_MS,
           ...(isUploadFinalizeQueued(uploadId) ? { inProgress: true } : {}),
+          ...buildFinalizeDiagnostics(meta),
         });
       }
 
@@ -660,6 +664,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
       pollAfterMs: FINALIZE_POLL_AFTER_MS,
       enqueued: queued.enqueued,
       ...(isUploadFinalizeQueued(uploadId) ? { inProgress: true } : {}),
+      ...buildFinalizeDiagnostics(meta),
     });
   });
 
