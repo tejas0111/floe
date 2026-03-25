@@ -297,7 +297,7 @@ async function runFinalizeJob(uploadId: string, log: FastifyBaseLogger) {
       ? Math.max(0, startedAt - Number(queuedAtRaw))
       : 0;
   observeFinalizeQueueWait(queueWaitMs);
-  const attempt = await redis.hincrby(uploadKeys.meta(uploadId), "finalizeAttempts", 1);
+  const attempt = Number(await redis.hincrby(uploadKeys.meta(uploadId), "finalizeAttempts", 1));
   await redis.hset(uploadKeys.meta(uploadId), {
     lastFinalizeAttemptAt: String(startedAt),
     finalizeQueueWaitMs: String(queueWaitMs),

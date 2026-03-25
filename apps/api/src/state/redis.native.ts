@@ -283,6 +283,10 @@ export class NativeRedisClient implements RedisClient {
     return (Array.isArray(reply) ? reply.map((v) => String(v)) : []) as T;
   }
 
+  async sismember(key: string, member: string) {
+    return Number(await this.send(["SISMEMBER", key, member]));
+  }
+
   async sadd(key: string, member: string) {
     return Number(await this.send(["SADD", key, member]));
   }

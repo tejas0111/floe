@@ -16,6 +16,7 @@ export type RedisClient = {
   hset: (key: string, kv: Record<string, unknown>) => Promise<unknown>;
   scard: (key: string) => Promise<unknown>;
   smembers: <T = string[]>(key: string) => Promise<T>;
+  sismember: (key: string, member: string) => Promise<unknown>;
   sadd: (key: string, member: string) => Promise<unknown>;
   srem: (key: string, member: string) => Promise<unknown>;
   zrem: (key: string, member: string) => Promise<unknown>;

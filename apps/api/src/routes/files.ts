@@ -29,6 +29,8 @@ function classifyStreamErrorReason(message: string): string {
   if (msg.includes("WALRUS_RANGE_FAILED")) return "walrus_range_failed";
   if (msg.includes("WALRUS_EMPTY_SEGMENT")) return "walrus_empty_segment";
   if (msg.includes("WALRUS_SEGMENT_OVERRUN")) return "walrus_segment_overrun";
+  if (msg.includes("WALRUS_MISSING_BODY")) return "walrus_missing_body";
+  if (msg.includes("STREAM_TRUNCATED")) return "stream_truncated";
   if (msg.includes("ABORT")) return "aborted";
   return "other";
 }
@@ -67,6 +69,10 @@ function normalizeSuiAddress(raw: unknown): string | null {
   const value = raw.trim();
   if (!SUI_ADDRESS_RE.test(value)) return null;
   return `0x${value.replace(/^0x/i, "").toLowerCase()}`;
+}
+
+function normalizeFileIdParam(raw: unknown): string | null {
+  return normalizeSuiAddress(raw);
 }
 
 function parseOptionalU64(raw: unknown): number | null {
@@ -350,7 +356,9 @@ async function* walrusByteStream(params: {
       }
 
       const body = upstream.body;
-      if (!body) return;
+      if (!body) {
+        throw new Error(`WALRUS_MISSING_BODY status=${upstream.status} offset=${offset} end=${segEnd}`);
+      }
 
       const rs = Readable.fromWeb(body as any);
       const expected = segEnd - offset + 1;
@@ -400,7 +408,12 @@ export async function filesRoutes(app: FastifyInstance) {
       });
     }
 
-    const { fileId } = req.params as { fileId: string };
+    const { fileId: rawFileId } = req.params as { fileId: string };
+    const fileId = normalizeFileIdParam(rawFileId);
+    if (!fileId) {
+      req.log.warn({ fileId: rawFileId }, "Invalid file id");
+      return sendApiError(res, 400, "INVALID_FILE_ID", "fileId must be a valid Sui object id");
+    }
 
     let fields: any | null = null;
     let fieldsSource: FileFieldsSource | null = null;
@@ -489,7 +502,12 @@ export async function filesRoutes(app: FastifyInstance) {
       });
     }
 
-    const { fileId } = req.params as { fileId: string };
+    const { fileId: rawFileId } = req.params as { fileId: string };
+    const fileId = normalizeFileIdParam(rawFileId);
+    if (!fileId) {
+      req.log.warn({ fileId: rawFileId }, "Invalid file id");
+      return sendApiError(res, 400, "INVALID_FILE_ID", "fileId must be a valid Sui object id");
+    }
 
     let fields: any | null = null;
     let fieldsSource: FileFieldsSource | null = null;
@@ -590,7 +608,17 @@ export async function filesRoutes(app: FastifyInstance) {
         });
       }
 
-      const { fileId } = req.params as { fileId: string };
+      const { fileId: rawFileId } = req.params as { fileId: string };
+      const fileId = normalizeFileIdParam(rawFileId);
+      if (!fileId) {
+        req.log.warn({ fileId: rawFileId }, "Invalid file id");
+        return sendApiError(
+          reply,
+          400,
+          "INVALID_FILE_ID",
+          "fileId must be a valid Sui object id"
+        );
+      }
 
       let fields: any | null = null;
       let fieldsSource: FileFieldsSource | null = null;
@@ -711,6 +739,7 @@ export async function filesRoutes(app: FastifyInstance) {
 
       const streamStartMs = Date.now();
       let firstByteObserved = false;
+      let totalStreamedBytes = 0;
       const stream = Readable.from(
         (async function* () {
           for await (const chunk of walrusByteStream({
@@ -730,7 +759,12 @@ export async function filesRoutes(app: FastifyInstance) {
                 durationMs: Date.now() - streamStartMs,
               });
             }
+            totalStreamedBytes += chunk.byteLength;
             yield chunk;
+          }
+
+          if (totalStreamedBytes !== span) {
+            throw new Error(`STREAM_TRUNCATED expected=${span} read=${totalStreamedBytes}`);
           }
         })()
       );
@@ -741,6 +775,20 @@ export async function filesRoutes(app: FastifyInstance) {
         if (err?.message === "FILE_CONTENT_NOT_FOUND") {
           err.message = "FILE_BLOB_UNAVAILABLE";
         }
+        req.log.warn(
+          {
+            err,
+            fileId,
+            blobId,
+            range: rangeHeader ?? null,
+            start,
+            end,
+            expectedBytes: span,
+            streamedBytes: totalStreamedBytes,
+            reason: classifyStreamErrorReason(String(err?.message ?? "")),
+          },
+          "Stream failed"
+        );
         recordStreamReadError(classifyStreamErrorReason(String(err?.message ?? "")));
       });
 
