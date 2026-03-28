@@ -242,6 +242,23 @@ For best first-play behavior with MP4 files, use stream-ready/faststart MP4s.
 - non-faststart MP4 files may have weaker first-play behavior even when range reads succeed
 - metadata caching reduces lookup cost, but cold playback still depends on Walrus/public aggregator health and latency
 
+### Cold Vs Warm Read Check
+
+Use the built-in measurement helper against a finalized file:
+
+```bash
+npm run measure:stream -- <fileId> --base-url http://localhost:3001 --range bytes=0-1048575 --runs 2
+```
+
+Interpretation:
+
+- run `1` is the cold read for that process/cache state
+- run `2` is the immediate warm follow-up read
+- compare `ttfbMs` first, then `totalMs`
+- capture at least a few samples per file before claiming a latency improvement
+
+This does not replace full p50/p95 benchmarking, but it gives a reproducible branch-level check for read-path regressions and warm-cache benefit.
+
 ## Metrics
 
 Floe exports:
