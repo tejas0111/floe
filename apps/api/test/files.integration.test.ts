@@ -1,6 +1,7 @@
 import test, { afterEach, before } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
+import { Readable } from "node:stream";
 
 process.env.FLOE_NETWORK = "testnet";
 process.env.SUI_PRIVATE_KEY = `[${new Array(32).fill(0).join(",")}]`;
@@ -21,6 +22,48 @@ let streamCacheModule: StreamCacheModule;
 let originalGetObject: typeof suiModule.suiClient.getObject;
 const originalFetch = globalThis.fetch;
 const walrusSamples = new Map<string, Uint8Array>();
+
+function buildFileFields(overrides?: Partial<{
+  blob_id: string;
+  size_bytes: string;
+  mime: string;
+  created_at: string;
+  owner: string;
+  walrus_end_epoch: string;
+}>) {
+  return {
+    blob_id: "blob-default",
+    size_bytes: "8",
+    mime: "video/mp4",
+    created_at: "1700000000000",
+    owner: "0x1111111111111111111111111111111111111111111111111111111111111111",
+    walrus_end_epoch: "12",
+    ...overrides,
+  };
+}
+
+async function mockSuiFile(fields?: Parameters<typeof buildFileFields>[0]) {
+  (suiModule.suiClient as any).getObject = async () => ({
+    data: {
+      content: {
+        dataType: "moveObject",
+        fields: buildFileFields(fields),
+      },
+    },
+  });
+}
+
+async function readPayloadBytes(payload: unknown): Promise<number[]> {
+  if (!(payload instanceof Readable)) {
+    return [];
+  }
+
+  const chunks: number[] = [];
+  for await (const chunk of payload) {
+    chunks.push(...chunk);
+  }
+  return chunks;
+}
 
 const log = {
   info() {},
@@ -142,6 +185,7 @@ async function createRouteApp() {
       return {
         statusCode: reply.statusCode,
         headers: reply.headers,
+        payload,
         json() {
           return payload;
         },
@@ -399,6 +443,96 @@ test("ensureCachedStreamRange persists exact bytes for a cached segment", async 
   const bytes = await fs.readFile(cachedPath);
 
   assert.deepEqual([...bytes], [2, 3, 4, 5, 6]);
+});
+
+test("stream route rejects invalid ranges with 416 and content-range size", async () => {
+  await mockSuiFile({
+    blob_id: "blob-invalid-range",
+    size_bytes: "10",
+  });
+  walrusSamples.set("blob-invalid-range", Uint8Array.from([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]));
+
+  const app = await createRouteApp();
+  const fileId = "0x8888888888888888888888888888888888888888888888888888888888888888";
+  const res = await app.inject({
+    method: "GET",
+    url: `/v1/files/${fileId}/stream`,
+    routePath: "/v1/files/:fileId/stream",
+    params: { fileId },
+    headers: { range: "bytes=20-30" },
+  });
+
+  assert.equal(res.statusCode, 416);
+  assert.equal(res.headers["content-range"], "bytes */10");
+  assert.equal(res.json().error.code, "INVALID_RANGE");
+});
+
+test("stream route serves suffix ranges", async () => {
+  await mockSuiFile({
+    blob_id: "blob-suffix-range",
+    size_bytes: "10",
+  });
+  walrusSamples.set("blob-suffix-range", Uint8Array.from([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]));
+
+  const app = await createRouteApp();
+  const fileId = "0x9999999999999999999999999999999999999999999999999999999999999999";
+  const res = await app.inject({
+    method: "GET",
+    url: `/v1/files/${fileId}/stream`,
+    routePath: "/v1/files/:fileId/stream",
+    params: { fileId },
+    headers: { range: "bytes=-3" },
+  });
+
+  assert.equal(res.statusCode, 206);
+  assert.equal(res.headers["content-range"], "bytes 7-9/10");
+  assert.equal(res.headers["content-length"], "3");
+  assert.deepEqual(await readPayloadBytes(res.payload), [7, 8, 9]);
+});
+
+test("stream route serves open-ended ranges", async () => {
+  await mockSuiFile({
+    blob_id: "blob-open-range",
+    size_bytes: "10",
+  });
+  walrusSamples.set("blob-open-range", Uint8Array.from([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]));
+
+  const app = await createRouteApp();
+  const fileId = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const res = await app.inject({
+    method: "GET",
+    url: `/v1/files/${fileId}/stream`,
+    routePath: "/v1/files/:fileId/stream",
+    params: { fileId },
+    headers: { range: "bytes=4-" },
+  });
+
+  assert.equal(res.statusCode, 206);
+  assert.equal(res.headers["content-range"], "bytes 4-9/10");
+  assert.equal(res.headers["content-length"], "6");
+  assert.deepEqual(await readPayloadBytes(res.payload), [4, 5, 6, 7, 8, 9]);
+});
+
+test("head stream route reflects valid range headers without streaming a body", async () => {
+  await mockSuiFile({
+    blob_id: "blob-head-range",
+    size_bytes: "10",
+  });
+
+  const app = await createRouteApp();
+  const fileId = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const res = await app.inject({
+    method: "HEAD",
+    url: `/v1/files/${fileId}/stream`,
+    routePath: "/v1/files/:fileId/stream",
+    params: { fileId },
+    headers: { range: "bytes=2-5" },
+  });
+
+  assert.equal(res.statusCode, 206);
+  assert.equal(res.headers["content-range"], "bytes 2-5/10");
+  assert.equal(res.headers["content-length"], "4");
+  assert.equal((res.json() as any).payload, undefined);
 });
 
 test("metadata and manifest expose public streamUrl when configured", async () => {

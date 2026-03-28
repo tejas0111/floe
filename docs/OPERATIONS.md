@@ -228,11 +228,19 @@ Current read-path behavior:
 
 - metadata and manifests are served from Sui-backed file metadata with optional Postgres read-model caching
 - stream responses support `200`, `206`, and `416`
+- stream routes accept bounded, open-ended, and suffix single-range requests
 - Walrus reads are stitched in bounded segments
 - playback reads use a smaller default segment size than the absolute max range size
 - segment fetches shrink on retry when public aggregators reject or fail larger range requests
 
 For best first-play behavior with MP4 files, use stream-ready/faststart MP4s.
+
+### Known Streaming Limits
+
+- only single-range reads are supported in phase 1
+- there is no HLS, DASH, transcoding, or adaptive bitrate playback yet
+- non-faststart MP4 files may have weaker first-play behavior even when range reads succeed
+- metadata caching reduces lookup cost, but cold playback still depends on Walrus/public aggregator health and latency
 
 ## Metrics
 
