@@ -7,6 +7,7 @@ import { sendApiError } from "../utils/apiError.js";
 import { ChunkConfig, UploadConfig } from "../config/uploads.config.js";
 import { WalrusEpochLimits } from "../config/walrus.config.js";
 import { AuthUploadPolicyConfig } from "../config/auth.config.js";
+import { checkRedisDependencyHealth } from "../services/health/dependencies.js";
 
 import {
   createSession,
@@ -21,6 +22,7 @@ import {
 import { applyRateLimitHeaders } from "../services/auth/auth.headers.js";
 
 import { chunkStore } from "../store/index.js";
+import type { RedisClient } from "../state/redis.types.js";
 import { getRedis } from "../state/redis.js";
 import { uploadKeys } from "../state/keys.js";
 
@@ -162,6 +164,28 @@ async function reconcileReceivedChunks(uploadId: string): Promise<number[]> {
   }
 
   return merged;
+}
+
+async function requireRedis(reply: any): Promise<RedisClient | null> {
+  const health = await checkRedisDependencyHealth();
+  if (health.status === "healthy") {
+    return getRedis();
+  }
+
+  reply.header("Retry-After", "5");
+  sendApiError(
+    reply,
+    503,
+    "DEPENDENCY_UNAVAILABLE",
+    "Redis is unavailable, retry shortly",
+    {
+      retryable: true,
+      details: {
+        dependency: "redis",
+      },
+    }
+  );
+  return null;
 }
 
 export default async function uploadRoutes(app: FastifyInstance) {
@@ -306,7 +330,8 @@ export default async function uploadRoutes(app: FastifyInstance) {
     }
 
     const uploadId = crypto.randomUUID();
-    const redis = getRedis();
+    const redis = await requireRedis(reply);
+    if (!redis) return;
     const capacityReserved = await tryReserveUploadCapacity({
       maxActiveUploads: UploadConfig.maxActiveUploads,
       uploadId,
@@ -391,7 +416,9 @@ export default async function uploadRoutes(app: FastifyInstance) {
       return sendApiError(reply, 400, "INVALID_UPLOAD_ID", "uploadId must be a UUID");
     }
 
-    const redis = getRedis();
+    const redis = await requireRedis(reply);
+    if (!redis) return;
+
     const [session, meta] = await Promise.all([
       getSession(uploadId),
       redis.hgetall<Record<string, string>>(uploadKeys.meta(uploadId)),
@@ -464,7 +491,6 @@ export default async function uploadRoutes(app: FastifyInstance) {
         expectedSize,
         isLastChunk
       );
-
       await redis.sadd(uploadKeys.chunks(uploadId), String(idx));
       await touchUploadActivity({ uploadId, chunkIndex: idx });
 
@@ -517,7 +543,8 @@ export default async function uploadRoutes(app: FastifyInstance) {
       return sendApiError(reply, 400, "INVALID_UPLOAD_ID", "uploadId must be a UUID");
     }
 
-    const redis = getRedis();
+    const redis = await requireRedis(reply);
+    if (!redis) return;
     const statusProbe = await redis.hget<string>(uploadKeys.meta(uploadId), "status");
     const statusScope = statusProbe === "finalizing" ? "file_meta_read" : "upload_control";
     const statusLimit = await req.server.authProvider.checkRateLimit({
@@ -657,7 +684,8 @@ export default async function uploadRoutes(app: FastifyInstance) {
       return sendApiError(reply, 400, "INVALID_UPLOAD_ID", "uploadId must be a UUID");
     }
 
-    const redis = getRedis();
+    const redis = await requireRedis(reply);
+    if (!redis) return;
     const metaKey = uploadKeys.meta(uploadId);
     const [session, meta] = await Promise.all([
       getSession(uploadId),
@@ -811,7 +839,8 @@ export default async function uploadRoutes(app: FastifyInstance) {
       return sendApiError(reply, 400, "INVALID_UPLOAD_ID", "uploadId must be a UUID");
     }
 
-    const redis = getRedis();
+    const redis = await requireRedis(reply);
+    if (!redis) return;
     const metaKey = uploadKeys.meta(uploadId);
     const lockKey = `${metaKey}:lock`;
 
