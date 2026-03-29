@@ -377,6 +377,13 @@ Verified API keys are configured through `FLOE_API_KEYS_JSON`. Each key can carr
 - `tier`
 - `scopes`
 
+Current enforced scopes:
+
+- `uploads:write` for upload create, chunk, complete, and cancel
+- `uploads:read` for upload status
+- `files:read` for file metadata, manifest, and stream
+- `*` grants full access
+
 ## Error Format
 
 All API errors use this envelope:
@@ -405,6 +412,7 @@ Common error codes include:
 - `RATE_LIMITED`
 - `AUTH_REQUIRED`
 - `OWNER_MISMATCH`
+- `INSUFFICIENT_SCOPE`
 - `FILE_BLOB_UNAVAILABLE`
 - `SUI_UNAVAILABLE`
 

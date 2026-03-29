@@ -37,6 +37,23 @@ class DefaultAuthProvider implements AuthProvider {
     return resolveRequestIdentity(req);
   }
 
+  private hasScope(identity: RequestIdentity, requiredScope: string): boolean {
+    if (!identity.authenticated) return false;
+    if (identity.scopes.includes("*")) return true;
+    return identity.scopes.includes(requiredScope);
+  }
+
+  private requireScope(identity: RequestIdentity, requiredScope: string): { allowed: true } | { allowed: false; code: string; message: string } {
+    if (this.hasScope(identity, requiredScope)) {
+      return { allowed: true };
+    }
+    return {
+      allowed: false,
+      code: "INSUFFICIENT_SCOPE",
+      message: `API key is missing required scope: ${requiredScope}`,
+    };
+  }
+
   private requireAuthentication(req: FastifyRequest, action: "upload" | "file_read"): { allowed: true; identity: RequestIdentity } | { allowed: false; code: string; message: string } {
     const identity = this.resolveIdentity(req);
     if (authRequiredForAction(action) && !identity.authenticated) {
@@ -60,6 +77,9 @@ class DefaultAuthProvider implements AuthProvider {
   }): Promise<{ allowed: boolean; code?: string; message?: string }> {
     const base = this.requireAuthentication(params.req, "upload");
     if (!base.allowed) return base;
+    const scope = params.action === "status" ? "uploads:read" : "uploads:write";
+    const scopeCheck = this.requireScope(base.identity, scope);
+    if (!scopeCheck.allowed) return scopeCheck;
     if (!AuthOwnerPolicyConfig.enforceUploadOwner) return { allowed: true };
     const expected = params.uploadOwner?.trim();
     if (!expected) return { allowed: true };
@@ -82,6 +102,8 @@ class DefaultAuthProvider implements AuthProvider {
   }): Promise<{ allowed: boolean; code?: string; message?: string }> {
     const base = this.requireAuthentication(params.req, "file_read");
     if (!base.allowed) return base;
+    const scopeCheck = this.requireScope(base.identity, "files:read");
+    if (!scopeCheck.allowed) return scopeCheck;
     if (!AuthOwnerPolicyConfig.enforceUploadOwner) return { allowed: true };
     const expected = params.fileOwner?.trim();
     if (!expected) return { allowed: true };
