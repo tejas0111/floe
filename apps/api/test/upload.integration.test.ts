@@ -448,6 +448,34 @@ test("cancel returns expired when upload already timed out", async () => {
   }
 });
 
+test("cancel returns retry-after when finalization is in progress", async () => {
+  const uploadId = await seedUpload();
+  const app = await createRouteApp();
+  try {
+    const redis = redisModule.getRedis();
+    const { uploadKeys } = keysModule;
+    await redis.hset(uploadKeys.meta(uploadId), {
+      status: "finalizing",
+    });
+    await redis.set(`${uploadKeys.meta(uploadId)}:lock`, "worker-1");
+
+    const res = await app.inject({
+      method: "DELETE",
+      url: `/v1/uploads/${uploadId}`,
+      routePath: "/v1/uploads/:uploadId",
+      params: { uploadId },
+    });
+    const body = res.json();
+
+    assert.equal(res.statusCode, 409);
+    assert.equal(res.headers["retry-after"], "2");
+    assert.equal(body.error.code, "UPLOAD_FINALIZATION_IN_PROGRESS");
+    assert.equal(body.error.retryable, false);
+  } finally {
+    await cleanupUpload(uploadId);
+  }
+});
+
 test("cancel cleans up partial upload artifacts and session state", async () => {
   const uploadId = await seedUpload();
   const app = await createRouteApp();

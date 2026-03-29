@@ -156,6 +156,7 @@ Behavior:
 - idempotent for `canceled`, `failed`, and `expired` sessions
 - returns `{ ok: true, uploadId, status: "expired" }` when the upload already timed out
 - returns `409` when finalize is in progress or the upload is already completed
+- `409 UPLOAD_FINALIZATION_IN_PROGRESS` includes `Retry-After`
 - best-effort staging cleanup runs for partial uploads before GC tracking is removed
 
 ## File Endpoints

@@ -879,6 +879,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
     }
 
     if (hasLock) {
+      reply.header("Retry-After", finalizePollRetryAfterSeconds());
       return sendApiError(
         reply,
         409,
