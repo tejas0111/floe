@@ -591,7 +591,6 @@ test("livez stays cheap and reports process liveness", async () => {
   assert.equal(body.service, "floe-api-v1");
   assert.equal(body.role, "full");
 });
-
 test("health route exposes node role capabilities", async () => {
   const app = await createRouteApp();
 
