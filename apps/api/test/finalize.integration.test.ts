@@ -260,6 +260,7 @@ before(async () => {
 });
 
 afterEach(async () => {
+  healthRouteModule?.healthRouteTestHooks?.resetCache?.();
   queueModule?.finalizeQueueTestHooks?.reset();
   if (redisModule) {
     await cleanupQueueState();
@@ -267,6 +268,7 @@ afterEach(async () => {
 });
 
 after(async () => {
+  healthRouteModule?.healthRouteTestHooks?.resetCache?.();
   queueModule?.finalizeQueueTestHooks?.reset();
   if (redisModule) {
     await cleanupQueueState().catch(() => {});
@@ -578,6 +580,18 @@ test("health route reports stalled finalize backlog as degraded", async () => {
   }
 });
 
+test("livez stays cheap and reports process liveness", async () => {
+  const app = await createRouteApp();
+
+  const res = await app.inject({ method: "GET", url: "/livez", routePath: "/livez" });
+  const body = res.json();
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(body.status, "UP");
+  assert.equal(body.service, "floe-api-v1");
+  assert.equal(body.role, "full");
+});
+
 test("health route exposes node role capabilities", async () => {
   const app = await createRouteApp();
 
@@ -597,6 +611,31 @@ test("health route exposes node role capabilities", async () => {
   assert.equal(body.walrus.writers.mode, "sdk");
   assert.equal(body.walrus.writers.count >= 1, true);
   assert.equal(typeof body.walrus.writers.primary, "string");
+});
+
+test("health route caches dependency probes across back-to-back requests", async () => {
+  const originalRedis = redisModule.getRedis();
+  let pingCalls = 0;
+  redisModule.setRedisForTests({
+    ...originalRedis,
+    ping: async () => {
+      pingCalls += 1;
+      return "PONG";
+    },
+  } as any);
+
+  const app = await createRouteApp();
+  try {
+    const first = await app.inject({ method: "GET", url: "/health", routePath: "/health" });
+    const second = await app.inject({ method: "GET", url: "/health", routePath: "/health" });
+
+    assert.equal(first.statusCode, 200);
+    assert.equal(second.statusCode, 200);
+    assert.equal(pingCalls, 1);
+  } finally {
+    redisModule.setRedisForTests(originalRedis);
+    healthRouteModule.healthRouteTestHooks.resetCache();
+  }
 });
 
 test("health route reports optional postgres outage as degraded but ready", async () => {

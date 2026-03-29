@@ -40,6 +40,25 @@ const FINALIZE_QUEUE_STUCK_AGE_MS = (() => {
   return n;
 })();
 
+const HEALTH_CACHE_TTL_MS = (() => {
+  const raw = process.env.FLOE_HEALTH_CACHE_TTL_MS;
+  if (raw === undefined || raw === "") return 1000;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0) {
+    throw new Error("FLOE_HEALTH_CACHE_TTL_MS must be an integer >= 0");
+  }
+  return n;
+})();
+
+type HealthSnapshot = {
+  statusCode: number;
+  payload: Record<string, unknown>;
+  expiresAt: number;
+};
+
+let cachedHealthSnapshot: HealthSnapshot | null = null;
+let inFlightHealthSnapshot: Promise<HealthSnapshot> | null = null;
+
 function bearerTokenFromAuthHeader(raw: unknown): string | undefined {
   if (typeof raw !== "string") return undefined;
   const m = raw.match(/^Bearer\s+(.+)$/i);
@@ -98,7 +117,125 @@ function parseBoolQuery(raw: unknown): boolean {
   return raw === true || raw === "1" || raw === "true";
 }
 
+async function buildHealthSnapshot(req: any): Promise<HealthSnapshot> {
+  const timestamp = new Date().toISOString();
+  let finalizeQueue:
+    | {
+        depth: number;
+        pendingUnique: number;
+        activeLocal: number;
+        concurrency: number;
+        oldestQueuedAt: number | null;
+        oldestQueuedAgeMs: number | null;
+      }
+    | null = null;
+  const redis = await checkRedisDependencyHealth();
+  const postgres = await checkPostgresDependencyHealth();
+
+  if (!redis.ok) {
+    req.log.error("Redis Health Check Failed");
+  }
+
+  if (redis.ok) {
+    try {
+      finalizeQueue = await getUploadFinalizeQueueStats();
+    } catch (err) {
+      req.log.error({ err }, "Finalize queue health read failed");
+    }
+  }
+
+  const baseReady =
+    redis.status === "healthy" &&
+    (postgres.status === "healthy" ||
+      postgres.status === "disabled" ||
+      postgres.status === "degraded");
+  const finalizeQueueHealth = assessFinalizeQueueHealth({
+    ready: baseReady,
+    finalizeQueue,
+    stuckAgeThresholdMs: FINALIZE_QUEUE_STUCK_AGE_MS,
+  });
+  const ready =
+    finalizeQueueHealth.ready &&
+    redis.status === "healthy" &&
+    postgres.status !== "unavailable";
+  const degraded =
+    finalizeQueueHealth.backlogStalled || postgres.status === "degraded";
+  const serviceStatus = ready ? (degraded ? "DEGRADED" : "UP") : "DOWN";
+  const statusCode = ready ? 200 : 503;
+
+  return {
+    statusCode,
+    expiresAt: Date.now() + HEALTH_CACHE_TTL_MS,
+    payload: {
+      role: TopologyConfig.role,
+      capabilities: {
+        uploads: TopologyConfig.routes.uploads,
+        files: TopologyConfig.routes.files,
+        ops: TopologyConfig.routes.ops,
+        finalizeWorker: TopologyConfig.workers.finalize,
+      },
+      walrus: {
+        readers: describeWalrusReaders(),
+        writers: describeWalrusWriters(),
+      },
+      status: serviceStatus,
+      service: "floe-api-v1",
+      ready,
+      degraded,
+      timestamp,
+      checks: {
+        redis,
+        postgres,
+        finalizeQueue: finalizeQueue ?? {
+          depth: null,
+          pendingUnique: null,
+          activeLocal: null,
+          concurrency: null,
+          oldestQueuedAt: null,
+          oldestQueuedAgeMs: null,
+        },
+        finalizeQueueWarning: finalizeQueueHealth.finalizeQueueWarning,
+      },
+    },
+  };
+}
+
+async function getCachedHealthSnapshot(req: any): Promise<HealthSnapshot> {
+  if (cachedHealthSnapshot && cachedHealthSnapshot.expiresAt > Date.now()) {
+    return cachedHealthSnapshot;
+  }
+
+  if (!inFlightHealthSnapshot) {
+    inFlightHealthSnapshot = buildHealthSnapshot(req)
+      .then((snapshot) => {
+        cachedHealthSnapshot = snapshot;
+        return snapshot;
+      })
+      .finally(() => {
+        inFlightHealthSnapshot = null;
+      });
+  }
+
+  return inFlightHealthSnapshot;
+}
+
+export const healthRouteTestHooks = {
+  resetCache() {
+    cachedHealthSnapshot = null;
+    inFlightHealthSnapshot = null;
+  },
+};
+
 export default async function healthRoute(app: FastifyInstance) {
+  app.get("/livez", async (_req, reply) => {
+    return reply.code(200).send({
+      status: "UP",
+      service: "floe-api-v1",
+      role: TopologyConfig.role,
+      timestamp: new Date().toISOString(),
+    });
+  });
+
   app.get("/metrics", async (req, reply) => {
     if (!requireMetricsToken(req, reply)) {
       return;
@@ -198,80 +335,7 @@ export default async function healthRoute(app: FastifyInstance) {
   }
 
   app.get("/health", async (req, reply) => {
-    const timestamp = new Date().toISOString();
-    let finalizeQueue:
-      | {
-          depth: number;
-          pendingUnique: number;
-          activeLocal: number;
-          concurrency: number;
-          oldestQueuedAt: number | null;
-          oldestQueuedAgeMs: number | null;
-        }
-      | null = null;
-    const redis = await checkRedisDependencyHealth();
-    const postgres = await checkPostgresDependencyHealth();
-
-    if (!redis.ok) {
-      req.log.error("Redis Health Check Failed");
-    }
-
-    if (redis.ok) {
-      try {
-        finalizeQueue = await getUploadFinalizeQueueStats();
-      } catch (err) {
-        req.log.error({ err }, "Finalize queue health read failed");
-      }
-    }
-
-    const baseReady =
-      redis.status === "healthy" &&
-      (postgres.status === "healthy" ||
-        postgres.status === "disabled" ||
-        postgres.status === "degraded");
-    const finalizeQueueHealth = assessFinalizeQueueHealth({
-      ready: baseReady,
-      finalizeQueue,
-      stuckAgeThresholdMs: FINALIZE_QUEUE_STUCK_AGE_MS,
-    });
-    const ready =
-      finalizeQueueHealth.ready &&
-      redis.status === "healthy" &&
-      postgres.status !== "unavailable";
-    const degraded =
-      finalizeQueueHealth.backlogStalled || postgres.status === "degraded";
-    const serviceStatus = ready ? (degraded ? "DEGRADED" : "UP") : "DOWN";
-
-    return reply.status(ready ? 200 : 503).send({
-      role: TopologyConfig.role,
-      capabilities: {
-        uploads: TopologyConfig.routes.uploads,
-        files: TopologyConfig.routes.files,
-        ops: TopologyConfig.routes.ops,
-        finalizeWorker: TopologyConfig.workers.finalize,
-      },
-      walrus: {
-        readers: describeWalrusReaders(),
-        writers: describeWalrusWriters(),
-      },
-      status: serviceStatus,
-      service: "floe-api-v1",
-      ready,
-      degraded,
-      timestamp,
-      checks: {
-        redis,
-        postgres,
-        finalizeQueue: finalizeQueue ?? {
-          depth: null,
-          pendingUnique: null,
-          activeLocal: null,
-          concurrency: null,
-          oldestQueuedAt: null,
-          oldestQueuedAgeMs: null,
-        },
-        finalizeQueueWarning: finalizeQueueHealth.finalizeQueueWarning,
-      },
-    });
+    const snapshot = await getCachedHealthSnapshot(req);
+    return reply.status(snapshot.statusCode).send(snapshot.payload);
   });
 }
