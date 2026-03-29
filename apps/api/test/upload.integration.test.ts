@@ -503,6 +503,70 @@ test("status returns retryable 503 when chunk store reconciliation fails", async
   }
 });
 
+test("complete returns stable finalizing shape when upload is already finalizing", async () => {
+  const uploadId = await seedUpload();
+  const app = await createRouteApp();
+  try {
+    const redis = redisModule.getRedis();
+    const { uploadKeys } = keysModule;
+    await redis.hset(uploadKeys.meta(uploadId), {
+      status: "finalizing",
+      finalizeAttemptState: "running",
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/v1/uploads/${uploadId}/complete`,
+      routePath: "/v1/uploads/:uploadId/complete",
+      params: { uploadId },
+    });
+    const body = res.json();
+
+    assert.equal(res.statusCode, 202);
+    assert.equal(body.uploadId, uploadId);
+    assert.equal(body.status, "finalizing");
+    assert.equal(body.enqueued, false);
+    assert.equal(typeof body.pollAfterMs, "number");
+    assert.equal(body.finalizeAttemptState, "running");
+  } finally {
+    await cleanupUpload(uploadId);
+  }
+});
+
+test("complete returns stable finalizing shape when only meta remains", async () => {
+  const uploadId = await seedUpload();
+  const app = await createRouteApp();
+  try {
+    const redis = redisModule.getRedis();
+    const { uploadKeys } = keysModule;
+    await redis.del(uploadKeys.session(uploadId));
+    await redis.hset(uploadKeys.meta(uploadId), {
+      status: "finalizing",
+      finalizeAttemptState: "retryable_failure",
+      failedReasonCode: "walrus_unavailable",
+      failedRetryable: "1",
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/v1/uploads/${uploadId}/complete`,
+      routePath: "/v1/uploads/:uploadId/complete",
+      params: { uploadId },
+    });
+    const body = res.json();
+
+    assert.equal(res.statusCode, 202);
+    assert.equal(body.uploadId, uploadId);
+    assert.equal(body.status, "finalizing");
+    assert.equal(body.enqueued, false);
+    assert.equal(body.finalizeAttemptState, "retryable_failure");
+    assert.equal(body.failedReasonCode, "walrus_unavailable");
+    assert.equal(body.failedRetryable, true);
+  } finally {
+    await cleanupUpload(uploadId);
+  }
+});
+
 test("cancel keeps gc tracking when terminal artifact cleanup fails", async () => {
   const uploadId = await seedUpload();
   const app = await createRouteApp();

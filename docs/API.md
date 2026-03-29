@@ -25,11 +25,29 @@ Optional JSON fields:
 
 Returns:
 
+- `201 Created`
 - `uploadId`
 - `chunkSize`
 - `totalChunks`
 - `epochs`
 - `expiresAt`
+
+Possible errors:
+
+- `400 INVALID_REQUEST_BODY`
+- `400 INVALID_CREATE_UPLOAD_REQUEST`
+- `400 INVALID_FILENAME`
+- `400 INVALID_CONTENT_TYPE`
+- `400 INVALID_FILE_SIZE`
+- `400 INVALID_CHUNK_SIZE`
+- `400 INVALID_EPOCHS`
+- `400 INVALID_TOTAL_CHUNKS`
+- `413 FILE_TOO_LARGE`
+- `413 TOO_MANY_CHUNKS`
+- `429 UPLOAD_CAPACITY_REACHED`
+- `429 RATE_LIMITED`
+- `503 DEPENDENCY_UNAVAILABLE`
+- `500 SESSION_CREATE_FAILED`
 
 ### `PUT /v1/uploads/:uploadId/chunk/:index`
 
@@ -107,12 +125,19 @@ Possible responses:
   - `pollAfterMs`
   - `enqueued`
   - optional `inProgress`
+  - optional finalize diagnostics such as `finalizeAttemptState`
+
+Notes:
+
+- `202` uses the same response shape whether finalize was just enqueued or was already in progress
+- when finalize is already in progress, the response includes `enqueued: false`
 
 Possible errors:
 
 - `409 UPLOAD_EXPIRED` when the upload timed out before finalize
 - `400 UPLOAD_INCOMPLETE` when not all chunks are present after reconciliation
 - `503 CHUNK_STORE_UNAVAILABLE` when chunk reconciliation cannot read from the staging backend
+- `503 FINALIZE_QUEUE_BACKPRESSURE` when finalize admission is saturated
 
 Finalize is asynchronous. Clients should poll `GET /v1/uploads/:uploadId/status`.
 

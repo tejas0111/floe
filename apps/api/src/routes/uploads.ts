@@ -716,6 +716,19 @@ export default async function uploadRoutes(app: FastifyInstance) {
       return sendApiError(reply, 409, "UPLOAD_EXPIRED", "Upload session expired");
     }
 
+    if (metaStatus === "finalizing") {
+      reply.header("Retry-After", String(Math.max(1, Math.ceil(FINALIZE_POLL_AFTER_MS / 1000))));
+      const inProgress = isUploadFinalizeQueued(uploadId);
+      return reply.code(202).send({
+        uploadId,
+        status: "finalizing",
+        pollAfterMs: FINALIZE_POLL_AFTER_MS,
+        enqueued: false,
+        ...(inProgress ? { inProgress: true } : {}),
+        ...buildFinalizeDiagnostics(currentMeta),
+      });
+    }
+
     if (!session) {
       if (metaStatus === "completed") {
         if (!meta?.fileId || !meta?.blobId) {
@@ -733,17 +746,6 @@ export default async function uploadRoutes(app: FastifyInstance) {
           sizeBytes: Number(meta.sizeBytes ?? 0),
           status: "ready",
           ...(meta?.walrusEndEpoch ? { walrusEndEpoch: Number(meta.walrusEndEpoch) } : {}),
-        });
-      }
-
-      if (metaStatus === "finalizing") {
-        reply.header("Retry-After", String(Math.max(1, Math.ceil(FINALIZE_POLL_AFTER_MS / 1000))));
-        return reply.code(202).send({
-          uploadId,
-          status: "finalizing",
-          pollAfterMs: FINALIZE_POLL_AFTER_MS,
-          ...(isUploadFinalizeQueued(uploadId) ? { inProgress: true } : {}),
-          ...buildFinalizeDiagnostics(currentMeta),
         });
       }
 
