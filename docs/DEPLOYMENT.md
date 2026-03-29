@@ -108,7 +108,7 @@ The container:
 - builds the API from TypeScript
 - runs production with `node apps/api/dist/server.js`
 - exposes port `3001`
-- uses `/health` as the readiness/health check
+- exposes cheap `/livez` and cached `/health`
 - accepts `FLOE_NODE_ROLE` and `FLOE_CONFIG` at runtime
 
 ## Minimal Production Environment
@@ -150,6 +150,12 @@ Optional topology config:
 FLOE_CONFIG=/etc/floe/config.yaml
 FLOE_NODE_ROLE=read
 ```
+
+Health recommendation:
+
+- use `/livez` for platform/container liveness
+- use `/health` for cached readiness and dependency state
+- tune `FLOE_HEALTH_CACHE_TTL_MS` if you need a different readiness refresh window
 
 ## Deploy Flow
 
