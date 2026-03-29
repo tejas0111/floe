@@ -68,9 +68,14 @@ function parsePositiveIntEnv(name: string, fallback: number, min = 1): number {
 const DEFAULT_OWNER_ADDRESS = parseOptionalSuiAddressEnv("FLOE_DEFAULT_OWNER_ADDRESS");
 
 const FINALIZE_POLL_AFTER_MS = parsePositiveIntEnv("FLOE_FINALIZE_STATUS_POLL_MS", 2000);
+const RETRYABLE_RETRY_AFTER_SECONDS = 5;
 
 function authzStatusCode(code?: string): 401 | 403 {
   return code === "AUTH_REQUIRED" ? 401 : 403;
+}
+
+function finalizePollRetryAfterSeconds(): string {
+  return String(Math.max(1, Math.ceil(FINALIZE_POLL_AFTER_MS / 1000)));
 }
 
 function readExpiresAt(meta?: Record<string, string> | null, session?: { expiresAt: number } | null): number | null {
@@ -172,7 +177,7 @@ async function requireRedis(reply: any): Promise<RedisClient | null> {
     return getRedis();
   }
 
-  reply.header("Retry-After", "5");
+  reply.header("Retry-After", String(RETRYABLE_RETRY_AFTER_SECONDS));
   sendApiError(
     reply,
     503,
@@ -579,6 +584,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
       receivedChunks = await reconcileReceivedChunks(uploadId);
     } catch (err) {
       req.log.error({ err, uploadId }, "Chunk store reconciliation failed during status");
+      reply.header("Retry-After", String(RETRYABLE_RETRY_AFTER_SECONDS));
       return sendApiError(
         reply,
         503,
@@ -717,7 +723,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
     }
 
     if (metaStatus === "finalizing") {
-      reply.header("Retry-After", String(Math.max(1, Math.ceil(FINALIZE_POLL_AFTER_MS / 1000))));
+      reply.header("Retry-After", finalizePollRetryAfterSeconds());
       const inProgress = isUploadFinalizeQueued(uploadId);
       return reply.code(202).send({
         uploadId,
@@ -776,6 +782,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
       receivedChunks = (await reconcileReceivedChunks(uploadId)).length;
     } catch (err) {
       req.log.error({ err, uploadId }, "Chunk store reconciliation failed during complete");
+      reply.header("Retry-After", String(RETRYABLE_RETRY_AFTER_SECONDS));
       return sendApiError(
         reply,
         503,
@@ -797,6 +804,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
 
     const queued = await enqueueUploadFinalize({ uploadId, log });
     if (queued.rejectedByBackpressure) {
+      reply.header("Retry-After", finalizePollRetryAfterSeconds());
       return sendApiError(
         reply,
         503,
@@ -805,7 +813,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
         { retryable: true }
       );
     }
-    reply.header("Retry-After", String(Math.max(1, Math.ceil(FINALIZE_POLL_AFTER_MS / 1000))));
+    reply.header("Retry-After", finalizePollRetryAfterSeconds());
     return reply.code(202).send({
       uploadId,
       status: "finalizing",

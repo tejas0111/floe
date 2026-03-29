@@ -89,6 +89,7 @@ Behavior notes:
 - active uploads expire from `expiresAt`, not only from passive Redis TTL eviction
 - chunk presence is reconciled from the backing chunk store when Redis chunk membership is incomplete
 - returns `503 CHUNK_STORE_UNAVAILABLE` when chunk reconciliation cannot read from the staging backend
+- retryable `503` responses include `Retry-After`
 
 Response may include:
 
@@ -138,6 +139,11 @@ Possible errors:
 - `400 UPLOAD_INCOMPLETE` when not all chunks are present after reconciliation
 - `503 CHUNK_STORE_UNAVAILABLE` when chunk reconciliation cannot read from the staging backend
 - `503 FINALIZE_QUEUE_BACKPRESSURE` when finalize admission is saturated
+
+Retry behavior:
+
+- `202 finalizing` includes `Retry-After`
+- retryable `503` responses from `complete` also include `Retry-After`
 
 Finalize is asynchronous. Clients should poll `GET /v1/uploads/:uploadId/status`.
 

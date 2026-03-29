@@ -495,6 +495,34 @@ test("status returns retryable 503 when chunk store reconciliation fails", async
     const body = res.json();
 
     assert.equal(res.statusCode, 503);
+    assert.equal(res.headers["retry-after"], "5");
+    assert.equal(body.error.code, "CHUNK_STORE_UNAVAILABLE");
+    assert.equal(body.error.retryable, true);
+  } finally {
+    storeIndexModule.chunkStore.listChunks = originalListChunks;
+    await cleanupUpload(uploadId);
+  }
+});
+
+test("complete returns retry-after on retryable chunk reconciliation failure", async () => {
+  const uploadId = await seedUpload();
+  const app = await createRouteApp();
+  const originalListChunks = storeIndexModule.chunkStore.listChunks.bind(storeIndexModule.chunkStore);
+  try {
+    storeIndexModule.chunkStore.listChunks = async () => {
+      throw new Error("disk unavailable");
+    };
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/v1/uploads/${uploadId}/complete`,
+      routePath: "/v1/uploads/:uploadId/complete",
+      params: { uploadId },
+    });
+    const body = res.json();
+
+    assert.equal(res.statusCode, 503);
+    assert.equal(res.headers["retry-after"], "5");
     assert.equal(body.error.code, "CHUNK_STORE_UNAVAILABLE");
     assert.equal(body.error.retryable, true);
   } finally {
