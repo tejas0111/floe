@@ -28,7 +28,6 @@ type SessionModule = typeof import("../src/services/uploads/session.ts");
 type UploadRoutesModule = typeof import("../src/routes/uploads.ts");
 type KeysModule = typeof import("../src/state/keys.ts");
 type StoreIndexModule = typeof import("../src/store/index.ts");
-
 let redisProcess: ChildProcess | null = null;
 let redisModule: RedisModule;
 let sessionModule: SessionModule;
@@ -78,7 +77,7 @@ function makeFilePart(buf: Buffer) {
   };
 }
 
-async function createRouteApp() {
+async function createRouteApp(customAuthProvider?: any) {
   const handlers = new Map<string, (req: any, reply: any) => Promise<unknown> | unknown>();
   const authProvider = {
     async authorizeUploadAccess() {
@@ -98,6 +97,7 @@ async function createRouteApp() {
         },
       };
     },
+    ...customAuthProvider,
   };
   const app = {
     get(path: string, handler: (req: any, reply: any) => Promise<unknown> | unknown) {
@@ -221,6 +221,34 @@ before(async () => {
   storeIndexModule = await import("../src/store/index.ts");
 
   await redisModule.initRedis();
+});
+
+test("create rejects authenticated keys missing uploads:write scope", async () => {
+  const app = await createRouteApp({
+    async authorizeUploadAccess() {
+      return {
+        allowed: false,
+        code: "INSUFFICIENT_SCOPE",
+        message: "API key is missing required scope: uploads:write",
+      };
+    },
+  });
+
+  const res = await app.inject({
+    method: "POST",
+    url: "/v1/uploads/create",
+    routePath: "/v1/uploads/create",
+    body: {
+      filename: "video.mp4",
+      contentType: "video/mp4",
+      sizeBytes: 8,
+    },
+  });
+  const body = res.json();
+
+  assert.equal(res.statusCode, 403);
+  assert.equal(body.error.code, "INSUFFICIENT_SCOPE");
+  assert.equal(body.error.message.includes("uploads:write"), true);
 });
 
 afterEach(async () => {

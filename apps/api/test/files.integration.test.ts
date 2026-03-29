@@ -95,7 +95,7 @@ function parseRangeHeader(
   };
 }
 
-async function createRouteApp() {
+async function createRouteApp(customAuthProvider?: any) {
   const handlers = new Map<string, (req: any, reply: any) => Promise<unknown> | unknown>();
   const authProvider = {
     async authorizeFileAccess() {
@@ -115,6 +115,7 @@ async function createRouteApp() {
         },
       };
     },
+    ...customAuthProvider,
   };
   const app = {
     get(path: string, handler: (req: any, reply: any) => Promise<unknown> | unknown) {
@@ -576,4 +577,29 @@ test("metadata and manifest expose public streamUrl when configured", async () =
     manifestRes.json().streamUrl,
     `https://cdn.example.com/floe/v1/files/${fileId}/stream`
   );
+});
+
+test("metadata rejects authenticated keys missing files:read scope", async () => {
+  await mockSuiFile();
+  const app = await createRouteApp({
+    async authorizeFileAccess() {
+      return {
+        allowed: false,
+        code: "INSUFFICIENT_SCOPE",
+        message: "API key is missing required scope: files:read",
+      };
+    },
+  });
+
+  const res = await app.inject({
+    method: "GET",
+    url: "/v1/files/0x2222222222222222222222222222222222222222222222222222222222222222/metadata",
+    routePath: "/v1/files/:fileId/metadata",
+    params: { fileId: "0x2222222222222222222222222222222222222222222222222222222222222222" },
+  });
+  const body = res.json() as any;
+
+  assert.equal(res.statusCode, 403);
+  assert.equal(body.error.code, "INSUFFICIENT_SCOPE");
+  assert.equal(body.error.message.includes("files:read"), true);
 });

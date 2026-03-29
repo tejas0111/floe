@@ -74,6 +74,12 @@ function authzStatusCode(code?: string): 401 | 403 {
   return code === "AUTH_REQUIRED" ? 401 : 403;
 }
 
+function authzErrorCode(code?: string): "AUTH_REQUIRED" | "OWNER_MISMATCH" | "INSUFFICIENT_SCOPE" {
+  if (code === "AUTH_REQUIRED") return "AUTH_REQUIRED";
+  if (code === "INSUFFICIENT_SCOPE") return "INSUFFICIENT_SCOPE";
+  return "OWNER_MISMATCH";
+}
+
 function finalizePollRetryAfterSeconds(): string {
   return String(Math.max(1, Math.ceil(FINALIZE_POLL_AFTER_MS / 1000)));
 }
@@ -223,7 +229,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
       return sendApiError(
         reply,
         authzStatusCode(authzCreate.code),
-        authzCreate.code === "AUTH_REQUIRED" ? "AUTH_REQUIRED" : "OWNER_MISMATCH",
+        authzErrorCode(authzCreate.code),
         authzCreate.message ?? "Upload access denied"
       );
     }
@@ -445,7 +451,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
       return sendApiError(
         reply,
         authzStatusCode(authzChunk.code),
-        authzChunk.code === "AUTH_REQUIRED" ? "AUTH_REQUIRED" : "OWNER_MISMATCH",
+        authzErrorCode(authzChunk.code),
         authzChunk.message ?? "Upload access denied"
       );
     }
@@ -609,7 +615,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
         return sendApiError(
         reply,
         authzStatusCode(authzStatus.code),
-        authzStatus.code === "AUTH_REQUIRED" ? "AUTH_REQUIRED" : "OWNER_MISMATCH",
+        authzErrorCode(authzStatus.code),
         authzStatus.message ?? "Upload access denied"
       );
       }
@@ -640,7 +646,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
       return sendApiError(
         reply,
         authzStatusCode(authzStatus.code),
-        authzStatus.code === "AUTH_REQUIRED" ? "AUTH_REQUIRED" : "OWNER_MISMATCH",
+        authzErrorCode(authzStatus.code),
         authzStatus.message ?? "Upload access denied"
       );
     }
@@ -711,7 +717,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
       return sendApiError(
         reply,
         authzStatusCode(authzComplete.code),
-        authzComplete.code === "AUTH_REQUIRED" ? "AUTH_REQUIRED" : "OWNER_MISMATCH",
+        authzErrorCode(authzComplete.code),
         authzComplete.message ?? "Upload access denied"
       );
     }
@@ -873,7 +879,7 @@ export default async function uploadRoutes(app: FastifyInstance) {
       return sendApiError(
         reply,
         authzStatusCode(authzCancel.code),
-        authzCancel.code === "AUTH_REQUIRED" ? "AUTH_REQUIRED" : "OWNER_MISMATCH",
+        authzErrorCode(authzCancel.code),
         authzCancel.message ?? "Upload access denied"
       );
     }
