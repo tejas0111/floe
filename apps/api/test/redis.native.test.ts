@@ -5,11 +5,21 @@ import { NativeRedisClient } from "../src/state/redis.native.ts";
 
 class FakeSocket {
   readonly writes: string[] = [];
+  ended = false;
+  destroyed = false;
 
   write(payload: string, _encoding: BufferEncoding, callback?: (err?: Error | null) => void) {
     this.writes.push(payload);
     callback?.(null);
     return true;
+  }
+
+  end() {
+    this.ended = true;
+  }
+
+  destroy() {
+    this.destroyed = true;
   }
 }
 
@@ -65,4 +75,20 @@ test("native redis client does not interleave commands into an active MULTI", as
 
   assert.deepEqual(await txPromise, ["OK", 1]);
   assert.equal(await pingPromise, "PONG");
+});
+
+test("native redis client rejects pending callers when the socket is closed", async () => {
+  const client = new NativeRedisClient({ url: "redis://127.0.0.1:6379" });
+  const socket = new FakeSocket();
+  (client as any).socket = socket;
+  (client as any).connected = true;
+
+  const pingPromise = client.ping();
+  await flushMicrotasks();
+
+  await client.close();
+
+  await assert.rejects(pingPromise, /Redis client closed|Redis socket closed/);
+  assert.equal(socket.ended, true);
+  assert.equal(socket.destroyed, true);
 });

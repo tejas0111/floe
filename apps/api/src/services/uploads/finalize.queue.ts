@@ -133,6 +133,7 @@ let processFinalizeImpl: typeof processFinalize = processFinalize;
 let scheduleRetryImpl: typeof scheduleRetry = scheduleRetry;
 let finalizeWorkerRunning = false;
 let autoDrainEnabled = true;
+const activeFinalizeProcesses = new Set<Promise<unknown>>();
 
 function queueKey() {
   return uploadKeys.finalizeQueue();
@@ -357,6 +358,15 @@ async function runFinalizeJob(uploadId: string, log: FastifyBaseLogger) {
 
   try {
     const processPromise = processFinalizeImpl({ uploadId, log, attempt, queueWaitMs });
+    activeFinalizeProcesses.add(processPromise);
+    void processPromise.then(
+      () => {
+        activeFinalizeProcesses.delete(processPromise);
+      },
+      () => {
+        activeFinalizeProcesses.delete(processPromise);
+      }
+    );
     void processPromise.then(
       () => {
         if (timedOut) {
@@ -580,6 +590,7 @@ export const finalizeQueueTestHooks = {
   },
   reset() {
     activeLocal.clear();
+    activeFinalizeProcesses.clear();
     finalizeWorkerRunning = false;
     autoDrainEnabled = true;
     finalizeQueueMaxDepth = parsePositiveIntEnv("FLOE_FINALIZE_QUEUE_MAX_DEPTH", 5000);
@@ -605,6 +616,9 @@ export const finalizeQueueTestHooks = {
   },
   setAutoDrain(enabled?: boolean) {
     autoDrainEnabled = enabled ?? true;
+  },
+  getActiveFinalizeProcessCount() {
+    return activeFinalizeProcesses.size;
   },
 };
 
@@ -636,6 +650,9 @@ export async function stopUploadFinalizeWorker(): Promise<void> {
   }
   retryTimers.clear();
   await finalizeWorkers.onIdle();
+  while (activeFinalizeProcesses.size > 0) {
+    await Promise.allSettled([...activeFinalizeProcesses]);
+  }
 }
 
 export async function enqueueUploadFinalize(params: {
