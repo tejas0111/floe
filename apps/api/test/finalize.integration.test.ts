@@ -594,6 +594,41 @@ test("stopUploadFinalizeWorker clears scheduled retry timers", async () => {
   }
 });
 
+test("stopUploadFinalizeWorker waits for timed-out finalize work to settle", async () => {
+  const uploadId = await seedUpload();
+  try {
+    await markUploadReadyForFinalize(uploadId);
+    let releaseFinalize: (() => void) | null = null;
+    queueModule.finalizeQueueTestHooks.setProcessFinalize(
+      async () =>
+        await new Promise<void>((resolve) => {
+          releaseFinalize = resolve;
+        })
+    );
+    await queueModule.finalizeQueueTestHooks.forceEnqueue(uploadId);
+
+    const jobPromise = queueModule.finalizeQueueTestHooks.runNextQueuedJob(log);
+    await sleep(1100);
+    await jobPromise;
+    assert.equal(queueModule.finalizeQueueTestHooks.getActiveFinalizeProcessCount(), 1);
+
+    let stopResolved = false;
+    const stopPromise = queueModule.stopUploadFinalizeWorker().then(() => {
+      stopResolved = true;
+    });
+
+    await sleep(100);
+    assert.equal(stopResolved, false);
+
+    releaseFinalize?.();
+    await stopPromise;
+    assert.equal(stopResolved, true);
+    assert.equal(queueModule.finalizeQueueTestHooks.getActiveFinalizeProcessCount(), 0);
+  } finally {
+    await cleanupUpload(uploadId);
+  }
+});
+
 test("enqueueUploadFinalize enforces queue backpressure atomically under concurrency", async () => {
   const firstUploadId = await seedUpload();
   const secondUploadId = await seedUpload();

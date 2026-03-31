@@ -353,6 +353,58 @@ test("duplicate chunk retry is idempotent and refreshes activity", async () => {
   }
 });
 
+test("chunk upload does not recreate a corrupt session after cancel wins the race", async () => {
+  const uploadId = await seedUpload();
+  const app = await createRouteApp();
+  const chunk = Buffer.from("test");
+  const expectedHash = createHash("sha256").update(chunk).digest("hex");
+  const redis = redisModule.getRedis();
+  const { uploadKeys } = keysModule;
+  const originalWriteChunk = storeIndexModule.chunkStore.writeChunk.bind(storeIndexModule.chunkStore);
+
+  try {
+    storeIndexModule.chunkStore.writeChunk = (async (...args: any[]) => {
+      const result = await originalWriteChunk(...args);
+      await redis.hset(uploadKeys.meta(uploadId), {
+        status: "canceled",
+        canceledAt: String(Date.now()),
+      });
+      await redis
+        .multi()
+        .del(uploadKeys.session(uploadId))
+        .del(uploadKeys.chunks(uploadId))
+        .srem(uploadKeys.gcIndex(), uploadId)
+        .srem(uploadKeys.activeIndex(), uploadId)
+        .exec();
+      return result;
+    }) as typeof storeIndexModule.chunkStore.writeChunk;
+
+    const res = await app.inject({
+      method: "PUT",
+      url: `/v1/uploads/${uploadId}/chunk/0`,
+      routePath: "/v1/uploads/:uploadId/chunk/:index",
+      params: { uploadId, index: "0" },
+      headers: { "x-chunk-sha256": expectedHash },
+      filePart: makeFilePart(chunk),
+    });
+    const body = res.json();
+
+    const session = await sessionModule.getSession(uploadId);
+    const meta = await redis.hgetall<Record<string, string>>(uploadKeys.meta(uploadId));
+    const chunks = await redis.smembers<string[]>(uploadKeys.chunks(uploadId));
+
+    assert.equal(res.statusCode, 404);
+    assert.equal(body.error.code, "UPLOAD_NOT_FOUND");
+    assert.equal(session, null);
+    assert.equal(meta.status, "canceled");
+    assert.deepEqual(chunks, []);
+  } finally {
+    storeIndexModule.chunkStore.writeChunk =
+      originalWriteChunk as typeof storeIndexModule.chunkStore.writeChunk;
+    await cleanupUpload(uploadId);
+  }
+});
+
 test("status and complete reconcile chunk membership from chunk store", async () => {
   const uploadId = await seedUpload();
   const app = await createRouteApp();

@@ -567,9 +567,22 @@ export default async function uploadRoutes(app: FastifyInstance) {
       );
       const persisted = await guardRedisDependency(reply, async () => {
         await redis.sadd(uploadKeys.chunks(uploadId), String(idx));
-        await touchUploadActivity({ uploadId, chunkIndex: idx });
+        return await touchUploadActivity({ uploadId, chunkIndex: idx });
       });
       if (persisted === REDIS_DEPENDENCY_UNAVAILABLE) return;
+      if (!persisted) {
+        await Promise.all([
+          redis.srem(uploadKeys.chunks(uploadId), String(idx)).catch(() => {}),
+          chunkStore.cleanup(uploadId).catch(() => {}),
+        ]);
+        const status = await redis
+          .hget<string>(uploadKeys.meta(uploadId), "status")
+          .catch(() => null);
+        if (status === "expired") {
+          return sendApiError(reply, 409, "UPLOAD_EXPIRED", "Upload session expired");
+        }
+        return sendApiError(reply, 404, "UPLOAD_NOT_FOUND", "Invalid uploadId");
+      }
 
       return {
         ok: true,
