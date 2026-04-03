@@ -1,0 +1,629 @@
+import { headersFromAuth, resolveHeaderProvider } from "./auth.js";
+import { FloeApiError, FloeError } from "./errors.js";
+import { createBrowserLocalStorageResumeStore } from "./resume.js";
+import type {
+  CompleteUploadReadyResponse,
+  CompleteUploadResponse,
+  CreateUploadInput,
+  CreateUploadResponse,
+  FileManifestResponse,
+  FileMetadataResponse,
+  FileStreamOptions,
+  FloeClientConfig,
+  JsonRequestOptions,
+  RequestOptions,
+  UploadBlobOptions,
+  UploadBlobResult,
+  UploadStatusResponse,
+  WaitForUploadReadyOptions,
+} from "./types.js";
+import {
+  applyHeaders,
+  buildQuery,
+  chunkByteLength,
+  computeBackoffMs,
+  isBlobLike,
+  joinUrl,
+  normalizeBaseUrl,
+  parseErrorBodySafe,
+  parseRetryAfterMs,
+  sha256Hex,
+  sleep,
+  toApiError,
+  withDefaultRetry,
+} from "./utils.js";
+
+export class FloeClient {
+  private static readonly DEFAULT_FINALIZE_MAX_WAIT_MS = 60 * 60_000;
+  private static readonly DEFAULT_FINALIZE_POLL_INTERVAL_MS = 5_000;
+
+  private readonly baseUrl: string;
+  private readonly fetchImpl: typeof fetch;
+  private readonly timeoutMs: number;
+  private readonly retry: ReturnType<typeof withDefaultRetry>;
+  private readonly authHeaders: Record<string, string>;
+  private readonly dynamicHeaders?: FloeClientConfig["headers"];
+  private readonly userAgent?: string;
+  private readonly resumeStore?: FloeClientConfig["resumeStore"];
+
+  constructor(config: FloeClientConfig = {}) {
+    this.baseUrl = normalizeBaseUrl(config.baseUrl);
+
+    const rawFetch = config.fetch ?? globalThis.fetch;
+    this.fetchImpl = rawFetch ? rawFetch.bind(globalThis) : undefined!;
+    if (!this.fetchImpl) {
+      throw new FloeError("No fetch implementation available");
+    }
+
+    this.timeoutMs = config.timeoutMs ?? 30_000;
+    this.retry = withDefaultRetry(config.retry);
+    this.authHeaders = headersFromAuth(config.auth);
+    this.dynamicHeaders = config.headers;
+    this.userAgent = config.userAgent ?? "@floehq/sdk";
+    this.resumeStore = config.resumeStore ?? this.resolveDefaultResumeStore();
+  }
+
+  async createUpload(
+    input: CreateUploadInput,
+    options: RequestOptions = {}
+  ): Promise<CreateUploadResponse> {
+    return this.requestJson<CreateUploadResponse>("POST", "/uploads/create", {
+      ...options,
+      json: {
+        filename: input.filename,
+        contentType: input.contentType,
+        sizeBytes: input.sizeBytes,
+        chunkSize: input.chunkSize,
+        epochs: input.epochs,
+      },
+    });
+  }
+
+  async uploadChunk(
+    uploadId: string,
+    index: number,
+    chunk: Blob,
+    sha256: string,
+    options: RequestOptions = {}
+  ): Promise<{ ok: boolean; chunkIndex: number; reused?: boolean }> {
+    const form = new FormData();
+    form.set("chunk", chunk, `chunk-${index}`);
+
+    return this.requestJson("PUT", `/uploads/${encodeURIComponent(uploadId)}/chunk/${index}`, {
+      ...options,
+      headers: {
+        ...(options.headers ?? {}),
+        "x-chunk-sha256": sha256,
+      },
+      body: form,
+    });
+  }
+
+  async getUploadStatus(
+    uploadId: string,
+    options: RequestOptions = {}
+  ): Promise<UploadStatusResponse> {
+    return this.requestJson("GET", `/uploads/${encodeURIComponent(uploadId)}/status`, options);
+  }
+
+  async completeUpload(
+    uploadId: string,
+    opts: RequestOptions & { includeBlobId?: boolean } = {}
+  ): Promise<CompleteUploadResponse> {
+    const response = await this.requestJson<
+      CompleteUploadResponse | { status: "ready"; fileId: string }
+    >("POST", `/uploads/${encodeURIComponent(uploadId)}/complete`, {
+      ...opts,
+      query: {
+        ...(opts.query ?? {}),
+        ...(opts.includeBlobId ? { includeBlobId: 1 } : {}),
+      },
+    });
+
+    if (response.status === "ready") {
+      return response as CompleteUploadReadyResponse;
+    }
+
+    return response as CompleteUploadResponse;
+  }
+
+  async cancelUpload(
+    uploadId: string,
+    options: RequestOptions = {}
+  ): Promise<{ ok: true; uploadId: string; status: string }> {
+    return this.requestJson("DELETE", `/uploads/${encodeURIComponent(uploadId)}`, options);
+  }
+
+  async getFileMetadata(
+    fileId: string,
+    opts: RequestOptions & { includeBlobId?: boolean } = {}
+  ): Promise<FileMetadataResponse> {
+    return this.requestJson("GET", `/files/${encodeURIComponent(fileId)}/metadata`, {
+      ...opts,
+      query: {
+        ...(opts.query ?? {}),
+        ...(opts.includeBlobId ? { includeBlobId: 1 } : {}),
+      },
+    });
+  }
+
+  async getFileManifest(
+    fileId: string,
+    opts: RequestOptions = {}
+  ): Promise<FileManifestResponse> {
+    return this.requestJson("GET", `/files/${encodeURIComponent(fileId)}/manifest`, opts);
+  }
+
+  getFileStreamUrl(fileId: string): string {
+    return joinUrl(this.baseUrl, `/files/${encodeURIComponent(fileId)}/stream`);
+  }
+
+  async streamFile(fileId: string, options: FileStreamOptions = {}): Promise<Response> {
+    const rangeHeader = this.buildRangeHeader(options.rangeStart, options.rangeEnd);
+    return this.requestResponse("GET", `/files/${encodeURIComponent(fileId)}/stream`, {
+      ...options,
+      headers: {
+        ...(options.headers ?? {}),
+        ...(rangeHeader ? { range: rangeHeader } : {}),
+      },
+    });
+  }
+
+  async downloadFile(fileId: string, options: FileStreamOptions = {}): Promise<Uint8Array> {
+    const res = await this.streamFile(fileId, options);
+    const ab = await res.arrayBuffer();
+    return new Uint8Array(ab);
+  }
+
+  async downloadFileAsBlob(fileId: string, options: FileStreamOptions = {}): Promise<Blob> {
+    const res = await this.streamFile(fileId, options);
+    return await res.blob();
+  }
+
+  async uploadBlob(blob: Blob, options: UploadBlobOptions): Promise<UploadBlobResult> {
+    if (!isBlobLike(blob)) {
+      throw new FloeError("uploadBlob requires a Blob/File input");
+    }
+    if (!options.filename?.trim()) {
+      throw new FloeError("uploadBlob requires filename");
+    }
+
+    const parallel = Math.max(1, Math.floor(options.parallel ?? 3));
+    const contentType =
+      options.contentType ?? blob.type ?? "application/octet-stream";
+    const resumeKey = options.resumeKey ?? this.defaultResumeKey(blob, options);
+
+    let create: CreateUploadResponse | undefined;
+    let uploadId = options.uploadId;
+    let uploadIdFromStore = false;
+
+    if (!uploadId && this.resumeStore) {
+      const stored = await this.resumeStore.get(resumeKey);
+      if (stored && stored.trim()) {
+        uploadId = stored.trim();
+        uploadIdFromStore = true;
+      }
+    }
+
+    if (!uploadId) {
+      create = await this.createUpload(
+        {
+          filename: options.filename,
+          contentType,
+          sizeBytes: blob.size,
+          chunkSize: options.chunkSize,
+          epochs: options.epochs,
+        },
+        { signal: options.signal }
+      );
+      uploadId = create.uploadId;
+      if (this.resumeStore) {
+        await this.resumeStore.set(resumeKey, uploadId);
+      }
+    }
+
+    let status: UploadStatusResponse;
+    try {
+      status = await this.getUploadStatus(uploadId, { signal: options.signal });
+    } catch (err) {
+      const staleStoredUpload =
+        uploadIdFromStore &&
+        err instanceof FloeApiError &&
+        (err.status === 404 || err.code === "UPLOAD_NOT_FOUND");
+
+      if (!staleStoredUpload) throw err;
+
+      if (this.resumeStore) {
+        await this.resumeStore.remove(resumeKey);
+      }
+
+      create = await this.createUpload(
+        {
+          filename: options.filename,
+          contentType,
+          sizeBytes: blob.size,
+          chunkSize: options.chunkSize,
+          epochs: options.epochs,
+        },
+        { signal: options.signal }
+      );
+      uploadId = create.uploadId;
+      status = await this.getUploadStatus(uploadId, { signal: options.signal });
+      if (this.resumeStore) {
+        await this.resumeStore.set(resumeKey, uploadId);
+      }
+    }
+
+    const chunkSize = create?.chunkSize ?? status.chunkSize;
+    const totalChunks = create?.totalChunks ?? status.totalChunks;
+    if (!chunkSize || !totalChunks) {
+      throw new FloeError("Upload status did not include valid chunkSize/totalChunks");
+    }
+
+    const uploaded = new Set(status.receivedChunks ?? []);
+    const pending: number[] = [];
+    for (let i = 0; i < totalChunks; i++) {
+      if (!uploaded.has(i)) pending.push(i);
+    }
+
+    let uploadedChunks = uploaded.size;
+    let uploadedBytes = (status.receivedChunks ?? []).reduce(
+      (sum, idx) => sum + chunkByteLength(idx, totalChunks, chunkSize, blob.size),
+      0
+    );
+
+    options.onProgress?.({
+      uploadId,
+      uploadedChunks,
+      totalChunks,
+      uploadedBytes,
+      totalBytes: blob.size,
+    });
+
+    let cursor = 0;
+    const worker = async () => {
+      while (true) {
+        if (options.signal?.aborted) {
+          throw new DOMException("The operation was aborted", "AbortError");
+        }
+
+        const idx = pending[cursor];
+        cursor += 1;
+        if (idx === undefined) return;
+
+        const start = idx * chunkSize;
+        const end = Math.min(blob.size, start + chunkSize);
+        const piece = blob.slice(start, end);
+        const raw = await piece.arrayBuffer();
+        const sha = await sha256Hex(raw);
+
+        await this.uploadChunk(uploadId, idx, piece, sha, { signal: options.signal });
+
+        uploadedChunks += 1;
+        uploadedBytes += piece.size;
+        options.onProgress?.({
+          uploadId,
+          uploadedChunks,
+          totalChunks,
+          uploadedBytes,
+          totalBytes: blob.size,
+        });
+      }
+    };
+
+    await Promise.all(
+      Array.from({ length: Math.min(parallel, pending.length || 1) }, () => worker())
+    );
+
+    const firstComplete = await this.completeUpload(uploadId, {
+      includeBlobId: options.includeBlobId,
+      signal: options.signal,
+    });
+
+    const complete =
+      firstComplete.status === "ready" && "fileId" in firstComplete
+        ? firstComplete
+        : await this.waitForUploadReadyInternal(uploadId, {
+            includeBlobId: options.includeBlobId,
+            signal: options.signal,
+            maxWaitMs:
+              options.finalizeMaxWaitMs ?? FloeClient.DEFAULT_FINALIZE_MAX_WAIT_MS,
+            pollIntervalMs:
+              options.finalizePollIntervalMs ??
+              FloeClient.DEFAULT_FINALIZE_POLL_INTERVAL_MS,
+            fallbackSizeBytes: blob.size,
+          });
+
+    if (this.resumeStore) {
+      await this.resumeStore.remove(resumeKey);
+    }
+
+    return {
+      uploadId,
+      fileId: complete.fileId,
+      sizeBytes: complete.sizeBytes,
+      status: complete.status,
+      ...(options.includeBlobId && complete.blobId ? { blobId: complete.blobId } : {}),
+      walrusEndEpoch: complete.walrusEndEpoch,
+      chunkSize,
+      totalChunks,
+    };
+  }
+
+  async uploadBytes(
+    bytes: Uint8Array | ArrayBuffer,
+    options: UploadBlobOptions
+  ): Promise<UploadBlobResult> {
+    const normalized = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    const copy = new Uint8Array(normalized.byteLength);
+    copy.set(normalized);
+    const blob = new Blob([copy.buffer], {
+      type: options.contentType ?? "application/octet-stream",
+    });
+    return this.uploadBlob(blob, options);
+  }
+
+  async waitForUploadReady(
+    uploadId: string,
+    options: WaitForUploadReadyOptions = {}
+  ): Promise<CompleteUploadReadyResponse> {
+    return this.waitForUploadReadyInternal(uploadId, {
+      includeBlobId: options.includeBlobId,
+      signal: options.signal,
+      maxWaitMs: options.maxWaitMs ?? FloeClient.DEFAULT_FINALIZE_MAX_WAIT_MS,
+      pollIntervalMs:
+        options.pollIntervalMs ?? FloeClient.DEFAULT_FINALIZE_POLL_INTERVAL_MS,
+    });
+  }
+
+  private async waitForUploadReadyInternal(
+    uploadId: string,
+    options: WaitForUploadReadyOptions & { fallbackSizeBytes?: number }
+  ): Promise<CompleteUploadReadyResponse> {
+    const startedAt = Date.now();
+    let lastErr: unknown;
+    let waitMs = options.pollIntervalMs ?? FloeClient.DEFAULT_FINALIZE_POLL_INTERVAL_MS;
+
+    while (Date.now() - startedAt < (options.maxWaitMs ?? FloeClient.DEFAULT_FINALIZE_MAX_WAIT_MS)) {
+      if (options.signal?.aborted) {
+        throw new DOMException("The operation was aborted", "AbortError");
+      }
+
+      try {
+        const status = await this.getUploadStatus(uploadId, {
+          signal: options.signal,
+          query: options.includeBlobId ? { includeBlobId: 1 } : undefined,
+        });
+
+        if (status.status === "completed" && status.fileId) {
+          let sizeBytes = options.fallbackSizeBytes;
+          if (sizeBytes === undefined) {
+            const metadata = await this.getFileMetadata(status.fileId, {
+              signal: options.signal,
+            });
+            sizeBytes = metadata.sizeBytes;
+          }
+
+          return {
+            fileId: status.fileId,
+            status: "ready",
+            sizeBytes: sizeBytes ?? 0,
+            ...(options.includeBlobId && status.blobId ? { blobId: status.blobId } : {}),
+            ...(status.walrusEndEpoch !== undefined
+              ? { walrusEndEpoch: status.walrusEndEpoch }
+              : {}),
+          };
+        }
+
+        if (status.status === "failed") {
+          throw new FloeError(status.error ?? "Upload finalization failed");
+        }
+
+        const pollAfterMs =
+          typeof status.pollAfterMs === "number" && status.pollAfterMs > 0
+            ? Number(status.pollAfterMs)
+            : waitMs;
+        waitMs = Math.max(
+          options.pollIntervalMs ?? FloeClient.DEFAULT_FINALIZE_POLL_INTERVAL_MS,
+          pollAfterMs
+        );
+      } catch (err) {
+        lastErr = err;
+
+        if (!(err instanceof FloeApiError)) {
+          throw err;
+        }
+
+        const shouldPoll =
+          err.status === 409 ||
+          err.status === 429 ||
+          err.code === "UPLOAD_FINALIZATION_IN_PROGRESS" ||
+          (err.retryable === true && err.status >= 500);
+
+        if (!shouldPoll) throw err;
+
+        const detailsObj =
+          err.details && typeof err.details === "object"
+            ? (err.details as Record<string, unknown>)
+            : undefined;
+        const retryAfterMs =
+          typeof detailsObj?.retryAfterMs === "number"
+            ? Number(detailsObj.retryAfterMs)
+            : undefined;
+
+        if (retryAfterMs && Number.isFinite(retryAfterMs) && retryAfterMs > 0) {
+          waitMs = Math.max(
+            options.pollIntervalMs ?? FloeClient.DEFAULT_FINALIZE_POLL_INTERVAL_MS,
+            Math.floor(retryAfterMs)
+          );
+        } else {
+          const pollInterval =
+            options.pollIntervalMs ?? FloeClient.DEFAULT_FINALIZE_POLL_INTERVAL_MS;
+          waitMs = Math.min(
+            10_000,
+            computeBackoffMs(
+              Math.max(1, Math.floor((Date.now() - startedAt) / pollInterval)),
+              pollInterval,
+              10_000
+            )
+          );
+        }
+      }
+
+      await sleep(waitMs, options.signal);
+    }
+
+    throw new FloeError("Upload finalization timed out", lastErr);
+  }
+
+  private async requestJson<T>(
+    method: string,
+    path: string,
+    options: JsonRequestOptions = {}
+  ): Promise<T> {
+    const response = await this.requestResponse(method, path, options);
+    return (await response.json()) as T;
+  }
+
+  private async requestResponse(
+    method: string,
+    path: string,
+    options: JsonRequestOptions = {}
+  ): Promise<Response> {
+    const url = `${joinUrl(this.baseUrl, path)}${buildQuery(options.query)}`;
+    let attempt = 0;
+    let lastErr: unknown;
+
+    while (attempt < this.retry.maxAttempts) {
+      attempt += 1;
+
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+      const linkedAbort = () => controller.abort();
+      options.signal?.addEventListener("abort", linkedAbort, { once: true });
+
+      try {
+        const headers = new Headers();
+        applyHeaders(headers, this.authHeaders);
+        applyHeaders(headers, await resolveHeaderProvider(this.dynamicHeaders));
+        applyHeaders(headers, options.headers);
+
+        let body = options.body;
+        if (options.json !== undefined) {
+          body = JSON.stringify(options.json);
+          if (!headers.has("content-type")) {
+            headers.set("content-type", "application/json");
+          }
+        }
+
+        if (this.userAgent && !headers.has("x-floe-sdk")) {
+          headers.set("x-floe-sdk", this.userAgent);
+        }
+
+        const response = await this.fetchImpl(url, {
+          method,
+          headers,
+          body,
+          signal: controller.signal,
+        });
+
+        if (response.ok) return response;
+
+        const bodyJson = await parseErrorBodySafe(response);
+        const apiError = toApiError(response, bodyJson);
+
+        if (
+          attempt < this.retry.maxAttempts &&
+          this.retry.retryOnStatuses.includes(response.status)
+        ) {
+          const retryAfterMs = parseRetryAfterMs(response.headers);
+          const backoffMs =
+            retryAfterMs ??
+            computeBackoffMs(
+              attempt,
+              this.retry.baseDelayMs,
+              this.retry.maxDelayMs
+            );
+          await sleep(backoffMs, options.signal);
+          continue;
+        }
+
+        throw apiError;
+      } catch (err) {
+        if (err instanceof FloeApiError) throw err;
+        lastErr = err;
+
+        if (options.signal?.aborted) {
+          throw err;
+        }
+
+        if (attempt < this.retry.maxAttempts) {
+          const backoffMs = computeBackoffMs(
+            attempt,
+            this.retry.baseDelayMs,
+            this.retry.maxDelayMs
+          );
+          await sleep(backoffMs, options.signal);
+          continue;
+        }
+      } finally {
+        clearTimeout(timeout);
+        options.signal?.removeEventListener("abort", linkedAbort);
+      }
+    }
+
+    throw new FloeError("Request failed after retries", lastErr);
+  }
+
+  private buildRangeHeader(
+    rangeStart?: number,
+    rangeEnd?: number
+  ): string | undefined {
+    if (rangeStart === undefined && rangeEnd === undefined) {
+      return undefined;
+    }
+    if (rangeStart !== undefined && (!Number.isInteger(rangeStart) || rangeStart < 0)) {
+      throw new FloeError("rangeStart must be an integer >= 0");
+    }
+    if (rangeEnd !== undefined && (!Number.isInteger(rangeEnd) || rangeEnd < 0)) {
+      throw new FloeError("rangeEnd must be an integer >= 0");
+    }
+    if (rangeStart !== undefined && rangeEnd !== undefined && rangeEnd < rangeStart) {
+      throw new FloeError("rangeEnd must be >= rangeStart");
+    }
+    if (rangeStart !== undefined && rangeEnd !== undefined) {
+      return `bytes=${rangeStart}-${rangeEnd}`;
+    }
+    if (rangeStart !== undefined) {
+      return `bytes=${rangeStart}-`;
+    }
+    return `bytes=-${rangeEnd}`;
+  }
+
+  private defaultResumeKey(blob: Blob, options: UploadBlobOptions): string {
+    const hasFileCtor = typeof File !== "undefined";
+    const lastModified =
+      hasFileCtor &&
+      blob instanceof File &&
+      Number.isFinite(blob.lastModified)
+        ? blob.lastModified
+        : 0;
+    const contentType =
+      options.contentType ?? blob.type ?? "application/octet-stream";
+    return `floe:${options.filename}:${blob.size}:${contentType}:${lastModified}`;
+  }
+
+  private resolveDefaultResumeStore() {
+    if (typeof window === "undefined") return undefined;
+
+    try {
+      if (window.localStorage) {
+        return createBrowserLocalStorageResumeStore();
+      }
+    } catch {
+      return undefined;
+    }
+
+    return undefined;
+  }
+}
