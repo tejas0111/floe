@@ -319,6 +319,33 @@ test("runFinalizeJob requeues retryable transient failures through the real work
   }
 });
 
+test("runFinalizeJob exits cleanly for a canceled upload left in the finalize queue", async () => {
+  const uploadId = await seedUpload();
+  try {
+    const redis = redisModule.getRedis();
+    const { uploadKeys } = keysModule;
+    await redis.hset(uploadKeys.meta(uploadId), {
+      status: "canceled",
+      canceledAt: String(Date.now()),
+    });
+    await redis.del(uploadKeys.session(uploadId));
+    await queueModule.finalizeQueueTestHooks.forceEnqueue(uploadId);
+
+    await queueModule.finalizeQueueTestHooks.runNextQueuedJob(log);
+
+    const meta = await redis.hgetall<Record<string, string>>(uploadKeys.meta(uploadId));
+    const stats = await queueModule.getUploadFinalizeQueueStats();
+
+    assert.equal(meta.status, "canceled");
+    assert.equal(meta.failedReasonCode, undefined);
+    assert.equal(meta.failedAt, undefined);
+    assert.equal(stats.depth, 0);
+    assert.equal(stats.pendingUnique, 0);
+  } finally {
+    await cleanupUpload(uploadId);
+  }
+});
+
 test("runFinalizeJob stops retrying after the configured retry ceiling", async () => {
   const uploadId = await seedUpload();
   try {
@@ -753,11 +780,7 @@ test("health route reports optional postgres outage as degraded but ready", asyn
 
 test("create upload returns retryable 503 when redis is unavailable", async () => {
   const originalRedis = redisModule.getRedis();
-  redisModule.setRedisForTests({
-    ping: async () => {
-      throw new Error("redis unavailable");
-    },
-  } as any);
+  redisModule.setRedisForTests(null);
 
   const app = await createRouteApp();
   try {
@@ -779,18 +802,14 @@ test("create upload returns retryable 503 when redis is unavailable", async () =
     assert.equal(body.error.retryable, true);
     assert.equal(body.error.details.dependency, "redis");
   } finally {
-    redisModule.setRedisForTests(originalRedis);
+    redisModule.setRedisForTests(originalRedis, true);
   }
 });
 
 test("upload routes return retryable 503 when redis is unavailable", async () => {
   const uploadId = await seedUpload({ totalChunks: 2 });
   const originalRedis = redisModule.getRedis();
-  redisModule.setRedisForTests({
-    ping: async () => {
-      throw new Error("redis unavailable");
-    },
-  } as any);
+  redisModule.setRedisForTests(null);
 
   const app = await createRouteApp();
   try {
@@ -835,7 +854,7 @@ test("upload routes return retryable 503 when redis is unavailable", async () =>
       assert.equal(body.error.details.dependency, "redis");
     }
   } finally {
-    redisModule.setRedisForTests(originalRedis);
+    redisModule.setRedisForTests(originalRedis, true);
     await cleanupUpload(uploadId);
   }
 });

@@ -19,7 +19,7 @@ import {
   createCachedReadStream,
   ensureCachedStreamBlob,
   ensureCachedStreamRange,
-  getCachedStreamPath,
+  getCachedStreamPathVerified,
 } from "../services/stream/stream.cache.js";
 
 function inferContainerFromMime(mimeType: string): string | null {
@@ -927,7 +927,7 @@ export async function filesRoutes(app: FastifyInstance) {
       }
 
       const cachedPath =
-        (await getCachedStreamPath(blobId)) ??
+        (await getCachedStreamPathVerified({ blobId, expectedSize: sizeBytes })) ??
         (status === 200
           ? await ensureCachedStreamBlob({
               blobId,

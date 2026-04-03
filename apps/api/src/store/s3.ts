@@ -1,6 +1,12 @@
 import crypto from "crypto";
 import { createRequire } from "module";
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { Readable } from "stream";
+import { pipeline } from "stream/promises";
+import { Transform } from "stream";
 
 import type { ChunkStore } from "./chunk.js";
 
@@ -51,31 +57,58 @@ type S3RuntimeConfig = {
   cmd: Omit<AwsS3Module, "S3Client">;
 };
 
-async function streamToBuffer(
+function createValidationStream(
+  expectedSize: number,
+  maxChunkBytes: number,
+  hash: crypto.Hash
+) {
+  let written = 0;
+
+  return new Transform({
+    transform(chunk: Buffer, _enc, cb) {
+      written += chunk.length;
+      if (written > expectedSize || written > maxChunkBytes) {
+        cb(new Error("CHUNK_TOO_LARGE"));
+        return;
+      }
+
+      hash.update(chunk);
+      cb(null, chunk);
+    },
+  });
+}
+
+async function spoolStreamToTempFile(
   stream: Readable,
   expectedSize: number,
   maxChunkBytes: number
-): Promise<{ buf: Buffer; actualSize: number; sha256: string }> {
+): Promise<{
+  actualSize: number;
+  sha256: string;
+  tempPath: string;
+  cleanup: () => Promise<void>;
+}> {
   const hash = crypto.createHash("sha256");
-  const chunks: Buffer[] = [];
-  let written = 0;
+  const validator = createValidationStream(expectedSize, maxChunkBytes, hash);
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "floe-s3-chunk-"));
+  const tempPath = path.join(tempDir, `${crypto.randomUUID()}.chunk`);
 
-  for await (const part of stream) {
-    const chunk = Buffer.isBuffer(part) ? part : Buffer.from(part);
-    written += chunk.length;
-    if (written > expectedSize || written > maxChunkBytes) {
-      throw new Error("CHUNK_TOO_LARGE");
-    }
-    hash.update(chunk);
-    chunks.push(chunk);
+  try {
+    await pipeline(stream, validator, fs.createWriteStream(tempPath, { flags: "wx" }));
+    const stat = await fsp.stat(tempPath);
+    const actualSize = stat.size;
+    return {
+      actualSize,
+      sha256: hash.digest("hex"),
+      tempPath,
+      cleanup: async () => {
+        await fsp.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+      },
+    };
+  } catch (err) {
+    await fsp.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    throw err;
   }
-
-  const buf = Buffer.concat(chunks, written);
-  return {
-    buf,
-    actualSize: written,
-    sha256: hash.digest("hex"),
-  };
 }
 
 export class S3ChunkStore implements ChunkStore {
@@ -150,30 +183,29 @@ export class S3ChunkStore implements ChunkStore {
       // Continue for missing keys.
     }
 
-    const { buf, actualSize, sha256 } = await streamToBuffer(
+    const { actualSize, sha256, tempPath, cleanup } = await spoolStreamToTempFile(
       stream,
       expectedSize,
       this.cfg.maxChunkBytes
     );
-
-    if (sha256 !== expectedHash.toLowerCase()) {
-      throw new Error("HASH_MISMATCH");
-    }
-
-    if (isLastChunk) {
-      if (actualSize <= 0 || actualSize > expectedSize) {
-        throw new Error("INVALID_LAST_CHUNK_SIZE");
-      }
-    } else if (actualSize !== expectedSize) {
-      throw new Error("CHUNK_SIZE_MISMATCH");
-    }
-
     try {
+      if (sha256 !== expectedHash.toLowerCase()) {
+        throw new Error("HASH_MISMATCH");
+      }
+
+      if (isLastChunk) {
+        if (actualSize <= 0 || actualSize > expectedSize) {
+          throw new Error("INVALID_LAST_CHUNK_SIZE");
+        }
+      } else if (actualSize !== expectedSize) {
+        throw new Error("CHUNK_SIZE_MISMATCH");
+      }
+
       await this.cfg.client.send(
         new this.cfg.cmd.PutObjectCommand({
           Bucket: this.cfg.bucket,
           Key: key,
-          Body: buf,
+          Body: fs.createReadStream(tempPath),
           ContentLength: actualSize,
           ContentType: "application/octet-stream",
           Metadata: {
@@ -190,6 +222,8 @@ export class S3ChunkStore implements ChunkStore {
         return { alreadyExisted: true };
       }
       throw err;
+    } finally {
+      await cleanup();
     }
   }
 

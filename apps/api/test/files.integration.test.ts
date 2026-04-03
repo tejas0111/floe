@@ -445,6 +445,37 @@ test("ensureCachedStreamRange persists exact bytes for a cached segment", async 
   assert.deepEqual([...bytes], [2, 3, 4, 5, 6]);
 });
 
+test("stream route evicts and refills corrupted full-object cache files", async () => {
+  const blobId = "blob-full-cache";
+  const bodyBytes = Uint8Array.from([0, 1, 2, 3, 4, 5, 6, 7]);
+  walrusSamples.set(blobId, bodyBytes);
+  await mockSuiFile({
+    blob_id: blobId,
+    size_bytes: String(bodyBytes.byteLength),
+  });
+
+  const cachedPath = await streamCacheModule.ensureCachedStreamBlob({
+    blobId,
+    sizeBytes: bodyBytes.byteLength,
+  });
+  assert.equal(typeof cachedPath, "string");
+
+  await fs.writeFile(cachedPath!, Buffer.from([9, 9, 9]));
+
+  const app = await createRouteApp();
+  const fileId = "0x1212121212121212121212121212121212121212121212121212121212121212";
+  const res = await app.inject({
+    method: "GET",
+    url: `/v1/files/${fileId}/stream`,
+    routePath: "/v1/files/:fileId/stream",
+    params: { fileId },
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(await readPayloadBytes(res.payload), [...bodyBytes]);
+  assert.equal((await fs.readFile(cachedPath!)).byteLength, bodyBytes.byteLength);
+});
+
 test("stream route rejects invalid ranges with 416 and content-range size", async () => {
   await mockSuiFile({
     blob_id: "blob-invalid-range",
