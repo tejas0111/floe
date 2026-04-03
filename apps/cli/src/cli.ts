@@ -34,101 +34,157 @@ type ResolvedCommand =
   | { kind: "ops.health" }
   | { kind: "config.show" };
 
+const ANSI = {
+  reset: "\x1b[0m",
+  bold: "\x1b[1m",
+  dim: "\x1b[2m",
+  cyan: "\x1b[36m",
+  blue: "\x1b[34m",
+  green: "\x1b[32m",
+  yellow: "\x1b[33m",
+  red: "\x1b[31m",
+  gray: "\x1b[90m",
+};
+
+const COLOR_ENABLED = Boolean(process.stdout.isTTY && !process.env.NO_COLOR);
+
+function paint(text: string, ...codes: string[]): string {
+  if (!COLOR_ENABLED || codes.length === 0) return text;
+  return `${codes.join("")}${text}${ANSI.reset}`;
+}
+
+function headline(text: string): string {
+  return paint(text, ANSI.bold, ANSI.cyan);
+}
+
+function section(title: string): string {
+  return `\n${paint(title, ANSI.bold, ANSI.blue)}`;
+}
+
+function valueLine(label: string, value: unknown): string {
+  const rendered =
+    value === null || value === undefined || value === "" ? paint("none", ANSI.gray) : String(value);
+  return `  ${paint(label.padEnd(16), ANSI.dim)} ${rendered}`;
+}
+
+function statusBadge(status: string | null | undefined): string {
+  const normalized = (status ?? "unknown").toLowerCase();
+  if (["ready", "up", "healthy", "ok"].includes(normalized)) {
+    return paint(normalized.toUpperCase(), ANSI.bold, ANSI.green);
+  }
+  if (["pending", "processing", "queued", "partial"].includes(normalized)) {
+    return paint(normalized.toUpperCase(), ANSI.bold, ANSI.yellow);
+  }
+  return paint(normalized.toUpperCase(), ANSI.bold, ANSI.red);
+}
+
+function formatBytes(bytes: number | null | undefined): string {
+  if (typeof bytes !== "number" || !Number.isFinite(bytes)) return "unknown";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+}
+
+function writeLines(lines: string[]) {
+  process.stdout.write(`${lines.join("\n")}\n`);
+}
+
 function printHelp(topic?: string) {
   const normalized = (topic ?? "").toLowerCase();
   if (normalized === "upload") {
-    process.stdout.write(`Floe CLI: upload
-
-Usage:
-  floe upload <file> [options]
-  floe upload status <uploadId> [options]
-  floe upload cancel <uploadId> [options]
-  floe upload complete <uploadId> [options]
-  floe upload wait <uploadId> [options]
-
-Notes:
-  upload resume is automatic by default through the local resume store
-  use --no-resume to disable that behavior
-`);
+    writeLines([
+      headline("Floe CLI  Upload"),
+      "Ship a file, inspect the upload, or finish an interrupted flow.",
+      section("Usage"),
+      "  floe upload <file> [options]",
+      "  floe upload status <uploadId> [options]",
+      "  floe upload cancel <uploadId> [options]",
+      "  floe upload complete <uploadId> [options]",
+      "  floe upload wait <uploadId> [options]",
+      section("Notes"),
+      "  resume is enabled by default through the local resume store",
+      "  use --no-resume when you want a clean upload session",
+      section("Examples"),
+      "  floe upload ./movie.mp4",
+      "  floe upload wait 123e4567-e89b-12d3-a456-426614174000",
+    ]);
     return;
   }
 
   if (normalized === "file") {
-    process.stdout.write(`Floe CLI: file
-
-Usage:
-  floe file metadata <fileId> [options]
-  floe file manifest <fileId> [options]
-  floe file stream-url <fileId> [options]
-`);
+    writeLines([
+      headline("Floe CLI  File"),
+      "Inspect file metadata, fetch manifests, and derive stream URLs.",
+      section("Usage"),
+      "  floe file metadata <fileId> [options]",
+      "  floe file manifest <fileId> [options]",
+      "  floe file stream-url <fileId> [options]",
+    ]);
     return;
   }
 
   if (normalized === "ops") {
-    process.stdout.write(`Floe CLI: ops
-
-Usage:
-  floe ops health [options]
-`);
+    writeLines([
+      headline("Floe CLI  Ops"),
+      "Check whether the Floe deployment is alive and ready to serve traffic.",
+      section("Usage"),
+      "  floe ops health [options]",
+    ]);
     return;
   }
 
-  process.stdout.write(`Floe CLI
-
-Usage:
-  floe <group> <command> [args] [options]
-
-Groups:
-  upload     upload, status, cancel, complete, and wait flows
-  file       metadata, manifest, and stream URL lookups
-  ops        health and operator-friendly checks
-  config     show the effective local CLI configuration
-  help       show top-level or group help
-
-Primary Commands:
-  floe upload <file>
-  floe upload status <uploadId>
-  floe upload cancel <uploadId>
-  floe upload complete <uploadId>
-  floe upload wait <uploadId>
-  floe file metadata <fileId>
-  floe file manifest <fileId>
-  floe file stream-url <fileId>
-  floe ops health
-  floe config show
-
-Shortcuts:
-  floe status <uploadId>
-  floe cancel <uploadId>
-  floe metadata <fileId>
-  floe manifest <fileId>
-  floe stream-url <fileId>
-
-Global Options:
-  --base-url <url>        Floe API base URL
-  --api-key <key>         x-api-key auth
-  --bearer <token>        Authorization bearer token
-  --owner-address <addr>  x-owner-address auth hint
-  --wallet-address <addr> x-wallet-address auth hint
-  --auth-user <id>        x-auth-user auth hint
-  --json                  Print JSON only
-  --include-blob-id       Ask Floe to include blobId when supported
-
-Upload Options:
-  --chunk-size <bytes>    Upload chunk size in bytes
-  --epochs <n>            Walrus epochs for upload create
-  --parallel <n>          Parallel chunk uploads (default: 3)
-  --no-resume             Disable resume-store lookup for uploads
-  --poll-interval-ms <n>  Finalize wait poll interval
-  --max-wait-ms <n>       Finalize max wait time
-
-Examples:
-  floe upload ./movie.mp4 --base-url http://127.0.0.1:3001/v1
-  floe upload wait 123e4567-e89b-12d3-a456-426614174000
-  floe file metadata 0xabc...
-  floe ops health
-  floe config show
-`);
+  writeLines([
+    headline("Floe CLI"),
+    "Developer tooling for uploads, file inspection, and operator checks.",
+    section("Usage"),
+    "  floe <group> <command> [args] [options]",
+    section("Groups"),
+    "  upload     upload files, resume flows, and finalize sessions",
+    "  file       inspect metadata, manifests, and stream URLs",
+    "  ops        health and deployment checks",
+    "  config     show the effective local CLI configuration",
+    "  help       show top-level or group help",
+    section("Primary Commands"),
+    "  floe upload <file>",
+    "  floe upload status <uploadId>",
+    "  floe upload cancel <uploadId>",
+    "  floe upload complete <uploadId>",
+    "  floe upload wait <uploadId>",
+    "  floe file metadata <fileId>",
+    "  floe file manifest <fileId>",
+    "  floe file stream-url <fileId>",
+    "  floe ops health",
+    "  floe config show",
+    section("Shortcuts"),
+    "  floe status <uploadId>",
+    "  floe cancel <uploadId>",
+    "  floe metadata <fileId>",
+    "  floe manifest <fileId>",
+    "  floe stream-url <fileId>",
+    section("Global Options"),
+    "  --base-url <url>        Floe API base URL",
+    "  --api-key <key>         x-api-key auth",
+    "  --bearer <token>        Authorization bearer token",
+    "  --owner-address <addr>  x-owner-address auth hint",
+    "  --wallet-address <addr> x-wallet-address auth hint",
+    "  --auth-user <id>        x-auth-user auth hint",
+    "  --json                  Print JSON only",
+    "  --include-blob-id       Ask Floe to include blobId when supported",
+    section("Upload Options"),
+    "  --chunk-size <bytes>    Upload chunk size in bytes",
+    "  --epochs <n>            Walrus epochs for upload create",
+    "  --parallel <n>          Parallel chunk uploads (default: 3)",
+    "  --no-resume             Disable resume-store lookup for uploads",
+    "  --poll-interval-ms <n>  Finalize wait poll interval",
+    "  --max-wait-ms <n>       Finalize max wait time",
+    section("Examples"),
+    "  floe upload ./movie.mp4 --base-url http://127.0.0.1:3001/v1",
+    "  floe upload wait 123e4567-e89b-12d3-a456-426614174000",
+    "  floe file metadata 0xabc...",
+    "  floe ops health",
+    "  floe config show",
+  ]);
 }
 
 function inferContentType(filePath: string): string {
@@ -301,8 +357,133 @@ function parseArgs(argv: string[]): {
 }
 
 function printResult(value: unknown, json: boolean) {
-  const text = JSON.stringify(value, null, 2);
-  process.stdout.write(`${text}\n`);
+  if (json) {
+    process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+    return;
+  }
+
+  process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+}
+
+function printUploadResult(
+  value: {
+    uploadId?: string;
+    fileId?: string;
+    sizeBytes?: number;
+    status?: string;
+    chunkSize?: number;
+    totalChunks?: number;
+  },
+  options: CliOptions
+) {
+  if (options.json) {
+    printResult(value, true);
+    return;
+  }
+
+  writeLines([
+    headline("Upload Complete"),
+    valueLine("status", statusBadge(value.status)),
+    valueLine("uploadId", value.uploadId),
+    valueLine("fileId", value.fileId),
+    valueLine("size", formatBytes(value.sizeBytes)),
+    valueLine("chunkSize", formatBytes(value.chunkSize)),
+    valueLine("chunks", value.totalChunks),
+  ]);
+}
+
+function printUploadStatusResult(value: Record<string, unknown>, options: CliOptions) {
+  if (options.json) {
+    printResult(value, true);
+    return;
+  }
+
+  writeLines([
+    headline("Upload Status"),
+    valueLine("status", statusBadge(String(value.status ?? "unknown"))),
+    valueLine("uploadId", value.uploadId),
+    valueLine("fileId", value.fileId),
+    valueLine("blobId", value.blobId),
+    valueLine("uploaded", formatBytes(typeof value.uploadedBytes === "number" ? value.uploadedBytes : null)),
+    valueLine("total", formatBytes(typeof value.sizeBytes === "number" ? value.sizeBytes : null)),
+    valueLine("chunks", value.totalChunks),
+  ]);
+}
+
+function printFileMetadataResult(value: Record<string, unknown>, options: CliOptions) {
+  if (options.json) {
+    printResult(value, true);
+    return;
+  }
+
+  writeLines([
+    headline("File Metadata"),
+    valueLine("fileId", value.fileId),
+    valueLine("blobId", value.blobId),
+    valueLine("mimeType", value.mimeType),
+    valueLine("size", formatBytes(typeof value.sizeBytes === "number" ? value.sizeBytes : null)),
+    valueLine("owner", value.owner),
+    valueLine("createdAt", value.createdAt),
+  ]);
+}
+
+function printHealthResult(value: Record<string, unknown>, options: CliOptions) {
+  if (options.json) {
+    printResult(value, true);
+    return;
+  }
+
+  const checks = (value.checks ?? {}) as Record<string, unknown>;
+  const redis = checks.redis as Record<string, unknown> | undefined;
+  const postgres = checks.postgres as Record<string, unknown> | undefined;
+  const finalizeQueue = checks.finalizeQueue as Record<string, unknown> | undefined;
+
+  writeLines([
+    headline("Deployment Health"),
+    valueLine("status", statusBadge(String(value.status ?? "unknown"))),
+    valueLine("service", value.service),
+    valueLine("role", value.role),
+    valueLine("ready", value.ready),
+    valueLine("degraded", value.degraded),
+    section("Dependencies"),
+    valueLine("redis", redis?.status ?? redis?.ok),
+    valueLine("postgres", postgres?.status ?? postgres?.ok),
+    valueLine("queueDepth", finalizeQueue?.depth),
+    valueLine("queueWorkers", finalizeQueue?.concurrency),
+  ]);
+}
+
+function printConfigResult(
+  value: {
+    baseUrl: string;
+    auth: Record<string, unknown>;
+    upload: Record<string, unknown>;
+  },
+  options: CliOptions
+) {
+  if (options.json) {
+    printResult(value, true);
+    return;
+  }
+
+  writeLines([
+    headline("CLI Configuration"),
+    valueLine("baseUrl", value.baseUrl),
+    section("Auth"),
+    valueLine("apiKey", value.auth.apiKey),
+    valueLine("bearer", value.auth.bearerToken),
+    valueLine("owner", value.auth.ownerAddress),
+    valueLine("authUser", value.auth.authUser),
+    valueLine("wallet", value.auth.walletAddress),
+    section("Upload"),
+    valueLine("chunkSize", value.upload.chunkSize),
+    valueLine("epochs", value.upload.epochs),
+    valueLine("parallel", value.upload.parallel),
+    valueLine("includeBlobId", value.upload.includeBlobId),
+    valueLine("resumeDisabled", value.upload.noResume),
+    valueLine("pollIntervalMs", value.upload.pollIntervalMs),
+    valueLine("maxWaitMs", value.upload.maxWaitMs),
+  ]);
 }
 
 async function readFileAsBlob(filePath: string, contentType: string): Promise<Blob> {
@@ -393,7 +574,7 @@ async function runUpload(filePathRaw: string | undefined, options: CliOptions) {
     },
   });
 
-  printResult(result, options.json);
+  printUploadResult(result, options);
 }
 
 async function runUploadStatus(uploadIdRaw: string | undefined, options: CliOptions) {
@@ -402,7 +583,7 @@ async function runUploadStatus(uploadIdRaw: string | undefined, options: CliOpti
   const result = await client.getUploadStatus(uploadId, {
     ...(options.includeBlobId ? { query: { includeBlobId: 1 } } : {}),
   });
-  printResult(result, options.json);
+  printUploadStatusResult(result as Record<string, unknown>, options);
 }
 
 async function runUploadCancel(uploadIdRaw: string | undefined, options: CliOptions) {
@@ -418,7 +599,7 @@ async function runUploadComplete(uploadIdRaw: string | undefined, options: CliOp
   const result = await client.completeUpload(uploadId, {
     ...(options.includeBlobId ? { includeBlobId: true } : {}),
   });
-  printResult(result, options.json);
+  printUploadStatusResult(result as Record<string, unknown>, options);
 }
 
 async function runUploadWait(uploadIdRaw: string | undefined, options: CliOptions) {
@@ -429,7 +610,7 @@ async function runUploadWait(uploadIdRaw: string | undefined, options: CliOption
     ...(options.pollIntervalMs ? { pollIntervalMs: options.pollIntervalMs } : {}),
     ...(options.maxWaitMs ? { maxWaitMs: options.maxWaitMs } : {}),
   });
-  printResult(result, options.json);
+  printUploadStatusResult(result as Record<string, unknown>, options);
 }
 
 async function runFileMetadata(fileIdRaw: string | undefined, options: CliOptions) {
@@ -438,7 +619,7 @@ async function runFileMetadata(fileIdRaw: string | undefined, options: CliOption
   const result = await client.getFileMetadata(fileId, {
     ...(options.includeBlobId ? { includeBlobId: true } : {}),
   });
-  printResult(result, options.json);
+  printFileMetadataResult(result as Record<string, unknown>, options);
 }
 
 async function runFileManifest(fileIdRaw: string | undefined, options: CliOptions) {
@@ -456,11 +637,11 @@ async function runFileStreamUrl(fileIdRaw: string | undefined, options: CliOptio
 
 async function runOpsHealth(options: CliOptions) {
   const result = await fetchJson(`${rootApiUrl(options.baseUrl)}/health`, options);
-  printResult(result, options.json);
+  printHealthResult(result as Record<string, unknown>, options);
 }
 
 async function runConfigShow(options: CliOptions) {
-  printResult(
+  printConfigResult(
     {
       baseUrl: options.baseUrl,
       auth: {
@@ -480,7 +661,7 @@ async function runConfigShow(options: CliOptions) {
         maxWaitMs: options.maxWaitMs ?? null,
       },
     },
-    options.json
+    options
   );
 }
 
@@ -526,26 +707,21 @@ async function main() {
 
 main().catch((err) => {
   if (err instanceof FloeApiError) {
-    process.stderr.write(
-      `${JSON.stringify(
-        {
-          error: {
-            message: err.message,
-            status: err.status,
-            code: err.code,
-            retryable: err.retryable,
-            requestId: err.requestId,
-            details: err.details,
-          },
-        },
-        null,
-        2
-      )}\n`
-    );
+    process.stderr.write(`${paint("Request Failed", ANSI.bold, ANSI.red)}\n`);
+    process.stderr.write(`  ${paint("message".padEnd(16), ANSI.dim)} ${err.message}\n`);
+    process.stderr.write(`  ${paint("status".padEnd(16), ANSI.dim)} ${String(err.status ?? "unknown")}\n`);
+    process.stderr.write(`  ${paint("code".padEnd(16), ANSI.dim)} ${String(err.code ?? "unknown")}\n`);
+    process.stderr.write(`  ${paint("retryable".padEnd(16), ANSI.dim)} ${String(Boolean(err.retryable))}\n`);
+    if (err.requestId) {
+      process.stderr.write(`  ${paint("requestId".padEnd(16), ANSI.dim)} ${err.requestId}\n`);
+    }
+    if (err.details) {
+      process.stderr.write(`${section("Details")}\n${JSON.stringify(err.details, null, 2)}\n`);
+    }
     process.exitCode = 1;
     return;
   }
 
-  process.stderr.write(`${String(err instanceof Error ? err.message : err)}\n`);
+  process.stderr.write(`${paint("Error", ANSI.bold, ANSI.red)} ${String(err instanceof Error ? err.message : err)}\n`);
   process.exitCode = 1;
 });
