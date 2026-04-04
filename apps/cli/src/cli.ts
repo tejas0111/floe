@@ -2,6 +2,7 @@
 
 import { FloeApiError, FloeClient, createNodeFileResumeStore } from "@floehq/sdk";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 
 type CliOptions = {
@@ -33,7 +34,35 @@ type ResolvedCommand =
   | { kind: "file.manifest"; fileId?: string }
   | { kind: "file.stream-url"; fileId?: string }
   | { kind: "ops.health" }
-  | { kind: "config.show" };
+  | { kind: "config.show" }
+  | { kind: "config.path" }
+  | { kind: "config.set"; key?: string; value?: string }
+  | { kind: "config.unset"; key?: string };
+
+type StoredConfig = {
+  baseUrl?: string;
+  apiKey?: string;
+  bearerToken?: string;
+  ownerAddress?: string;
+  authUser?: string;
+  walletAddress?: string;
+};
+
+type ParsedArgState = {
+  tokens: string[];
+  overrides: Partial<CliOptions>;
+};
+
+const CONFIG_KEY_MAP = {
+  "base-url": "baseUrl",
+  "api-key": "apiKey",
+  bearer: "bearerToken",
+  "owner-address": "ownerAddress",
+  "auth-user": "authUser",
+  "wallet-address": "walletAddress",
+} as const;
+
+type ConfigKey = keyof typeof CONFIG_KEY_MAP;
 
 const ANSI = {
   reset: "\x1b[0m",
@@ -66,6 +95,11 @@ function valueLine(label: string, value: unknown): string {
   const rendered =
     value === null || value === undefined || value === "" ? paint("none", ANSI.gray) : String(value);
   return `  ${paint(label.padEnd(16), ANSI.dim)} ${rendered}`;
+}
+
+function pushOptionalLine(lines: string[], label: string, value: unknown) {
+  if (value === null || value === undefined || value === "") return;
+  lines.push(valueLine(label, value));
 }
 
 function infoLine(message: string) {
@@ -117,6 +151,33 @@ function writeLines(lines: string[]) {
 
 function printHelp(topic?: string) {
   const normalized = (topic ?? "").toLowerCase();
+  if (normalized === "config") {
+    writeLines([
+      headline("Floe CLI  Config"),
+      "Persist defaults for the CLI so you do not have to repeat flags.",
+      section("Usage"),
+      "  floe config show",
+      "  floe config path",
+      "  floe config set <key> <value>",
+      "  floe config unset <key>",
+      section("Keys"),
+      "  base-url",
+      "  api-key",
+      "  bearer",
+      "  owner-address",
+      "  auth-user",
+      "  wallet-address",
+      section("Precedence"),
+      "  flags override env vars, env vars override config, config overrides defaults",
+      section("Examples"),
+      "  floe config set base-url https://api.floehq.com/v1",
+      "  floe config set api-key sk_live_xxx",
+      "  floe config unset api-key",
+      "  floe config path",
+    ]);
+    return;
+  }
+
   if (normalized === "upload") {
     writeLines([
       headline("Floe CLI  Upload"),
@@ -181,6 +242,9 @@ function printHelp(topic?: string) {
     "  floe file stream-url <fileId>",
     "  floe ops health",
     "  floe config show",
+    "  floe config path",
+    "  floe config set <key> <value>",
+    "  floe config unset <key>",
     section("Shortcuts"),
     "  floe status <uploadId>",
     "  floe cancel <uploadId>",
@@ -210,6 +274,7 @@ function printHelp(topic?: string) {
     "  floe file metadata 0xabc...",
     "  floe ops health",
     "  floe config show",
+    "  floe config set base-url https://api.floehq.com/v1",
   ]);
 }
 
@@ -230,22 +295,59 @@ function parseIntFlag(value?: string): number | undefined {
   return Math.floor(n);
 }
 
-function parseArgs(argv: string[]): {
-  command: ResolvedCommand;
-  options: CliOptions;
-} {
-  const tokens: string[] = [];
-  const options: CliOptions = {
-    baseUrl: process.env.FLOE_BASE_URL || "http://127.0.0.1:3001/v1",
-    apiKey: process.env.FLOE_API_KEY,
-    bearerToken: process.env.FLOE_BEARER_TOKEN,
-    ownerAddress: process.env.FLOE_OWNER_ADDRESS,
-    authUser: process.env.FLOE_AUTH_USER,
-    walletAddress: process.env.FLOE_WALLET_ADDRESS,
+function defaultOptions(): CliOptions {
+  return {
+    baseUrl: "http://127.0.0.1:3001/v1",
     json: false,
     verbose: false,
     parallel: 3,
   };
+}
+
+function getConfigPath(): string {
+  const root = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
+  return path.join(root, "floe", "config.json");
+}
+
+async function readStoredConfig(): Promise<StoredConfig> {
+  try {
+    const raw = await fs.readFile(getConfigPath(), "utf8");
+    const parsed = JSON.parse(raw) as StoredConfig;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return {};
+    throw error;
+  }
+}
+
+async function writeStoredConfig(config: StoredConfig): Promise<void> {
+  const configPath = getConfigPath();
+  await fs.mkdir(path.dirname(configPath), { recursive: true });
+  await fs.writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+}
+
+function applyStoredConfig(options: CliOptions, config: StoredConfig) {
+  if (config.baseUrl) options.baseUrl = config.baseUrl;
+  if (config.apiKey) options.apiKey = config.apiKey;
+  if (config.bearerToken) options.bearerToken = config.bearerToken;
+  if (config.ownerAddress) options.ownerAddress = config.ownerAddress;
+  if (config.authUser) options.authUser = config.authUser;
+  if (config.walletAddress) options.walletAddress = config.walletAddress;
+}
+
+function applyEnvConfig(options: CliOptions) {
+  if (process.env.FLOE_BASE_URL) options.baseUrl = process.env.FLOE_BASE_URL;
+  if (process.env.FLOE_API_KEY) options.apiKey = process.env.FLOE_API_KEY;
+  if (process.env.FLOE_BEARER_TOKEN) options.bearerToken = process.env.FLOE_BEARER_TOKEN;
+  if (process.env.FLOE_OWNER_ADDRESS) options.ownerAddress = process.env.FLOE_OWNER_ADDRESS;
+  if (process.env.FLOE_AUTH_USER) options.authUser = process.env.FLOE_AUTH_USER;
+  if (process.env.FLOE_WALLET_ADDRESS) options.walletAddress = process.env.FLOE_WALLET_ADDRESS;
+}
+
+function parseArgState(argv: string[]): ParsedArgState {
+  const tokens: string[] = [];
+  const overrides: Partial<CliOptions> = {};
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -262,57 +364,61 @@ function parseArgs(argv: string[]): {
 
     switch (arg) {
       case "--base-url":
-        options.baseUrl = readValue() || options.baseUrl;
+        overrides.baseUrl = readValue() || defaultOptions().baseUrl;
         break;
       case "--api-key":
-        options.apiKey = readValue() || "";
+        overrides.apiKey = readValue() || "";
         break;
       case "--bearer":
-        options.bearerToken = readValue() || "";
+        overrides.bearerToken = readValue() || "";
         break;
       case "--owner-address":
-        options.ownerAddress = readValue() || "";
+        overrides.ownerAddress = readValue() || "";
         break;
       case "--wallet-address":
-        options.walletAddress = readValue() || "";
+        overrides.walletAddress = readValue() || "";
         break;
       case "--auth-user":
-        options.authUser = readValue() || "";
+        overrides.authUser = readValue() || "";
         break;
       case "--chunk-size":
-        options.chunkSize = parseIntFlag(readValue());
+        overrides.chunkSize = parseIntFlag(readValue());
         break;
       case "--epochs":
-        options.epochs = parseIntFlag(readValue());
+        overrides.epochs = parseIntFlag(readValue());
         break;
       case "--parallel":
-        options.parallel = parseIntFlag(readValue());
+        overrides.parallel = parseIntFlag(readValue());
         break;
       case "--poll-interval-ms":
-        options.pollIntervalMs = parseIntFlag(readValue());
+        overrides.pollIntervalMs = parseIntFlag(readValue());
         break;
       case "--max-wait-ms":
-        options.maxWaitMs = parseIntFlag(readValue());
+        overrides.maxWaitMs = parseIntFlag(readValue());
         break;
       case "--include-blob-id":
-        options.includeBlobId = true;
+        overrides.includeBlobId = true;
         break;
       case "--no-resume":
-        options.noResume = true;
+        overrides.noResume = true;
         break;
       case "--json":
-        options.json = true;
+        overrides.json = true;
         break;
       case "--verbose":
       case "-v":
-        options.verbose = true;
+        overrides.verbose = true;
         break;
       default:
         break;
     }
   }
 
-  const [first, second, third] = tokens.map((v) => v.toLowerCase());
+  return { tokens, overrides };
+}
+
+function resolveCommand(tokens: string[]): ResolvedCommand {
+  const [first, second] = tokens.map((v) => v.toLowerCase());
   let command: ResolvedCommand;
 
   switch (first ?? "help") {
@@ -359,7 +465,26 @@ function parseArgs(argv: string[]): {
       command = second === "health" ? { kind: "ops.health" } : { kind: "help", topic: "ops" };
       break;
     case "config":
-      command = second === "show" ? { kind: "config.show" } : { kind: "help" };
+      switch (second) {
+        case "show":
+          command = { kind: "config.show" };
+          break;
+        case "path":
+          command = { kind: "config.path" };
+          break;
+        case "set":
+          command = { kind: "config.set", key: tokens[2], value: tokens[3] };
+          break;
+        case "unset":
+          command = { kind: "config.unset", key: tokens[2] };
+          break;
+        case "help":
+          command = { kind: "help", topic: "config" };
+          break;
+        default:
+          command = { kind: "help", topic: "config" };
+          break;
+      }
       break;
     case "status":
       command = { kind: "upload.status", uploadId: tokens[1] };
@@ -384,7 +509,29 @@ function parseArgs(argv: string[]): {
       break;
   }
 
-  return { command, options };
+  return command;
+}
+
+async function parseArgs(argv: string[]): Promise<{
+  command: ResolvedCommand;
+  options: CliOptions;
+}> {
+  const { tokens } = parseArgState(argv);
+  const options = defaultOptions();
+  applyStoredConfig(options, await readStoredConfig());
+  applyEnvConfig(options);
+  const { overrides: overrideOptions } = parseArgState(argv);
+  Object.assign(options, overrideOptions);
+  return { command: resolveCommand(tokens), options };
+}
+
+function requireConfigKey(key: string | undefined): ConfigKey {
+  if (!key) throw new Error("config key is required");
+  const normalized = key.toLowerCase() as ConfigKey;
+  if (!(normalized in CONFIG_KEY_MAP)) {
+    throw new Error(`unsupported config key: ${key}`);
+  }
+  return normalized;
 }
 
 function printResult(value: unknown, json: boolean) {
@@ -446,16 +593,19 @@ function printUploadStatusResult(value: Record<string, unknown>, options: CliOpt
     return;
   }
 
-  writeLines([
+  const lines = [
     headline("Upload Status"),
     valueLine("status", statusBadge(String(value.status ?? "unknown"))),
     valueLine("uploadId", value.uploadId),
     valueLine("fileId", value.fileId),
-    valueLine("blobId", value.blobId),
     valueLine("uploaded", formatBytes(typeof value.uploadedBytes === "number" ? value.uploadedBytes : null)),
     valueLine("total", formatBytes(typeof value.sizeBytes === "number" ? value.sizeBytes : null)),
     valueLine("chunks", value.totalChunks),
-  ]);
+  ];
+  if (options.includeBlobId) {
+    pushOptionalLine(lines, "blobId", value.blobId);
+  }
+  writeLines(lines);
 }
 
 function printManifestResult(value: Record<string, unknown>, options: CliOptions) {
@@ -464,15 +614,18 @@ function printManifestResult(value: Record<string, unknown>, options: CliOptions
     return;
   }
 
-  writeLines([
+  const lines = [
     headline("File Manifest"),
     valueLine("fileId", value.fileId),
     valueLine("manifestVersion", value.manifestVersion),
     valueLine("container", value.container),
     valueLine("tracks", Array.isArray(value.tracks) ? value.tracks.length : value.tracks),
     valueLine("segmentCount", Array.isArray(value.segments) ? value.segments.length : value.segments),
-    valueLine("blobId", value.blobId),
-  ]);
+  ];
+  if (options.includeBlobId) {
+    pushOptionalLine(lines, "blobId", value.blobId);
+  }
+  writeLines(lines);
 }
 
 function printFileMetadataResult(value: Record<string, unknown>, options: CliOptions) {
@@ -481,15 +634,18 @@ function printFileMetadataResult(value: Record<string, unknown>, options: CliOpt
     return;
   }
 
-  writeLines([
+  const lines = [
     headline("File Metadata"),
     valueLine("fileId", value.fileId),
-    valueLine("blobId", value.blobId),
     valueLine("mimeType", value.mimeType),
     valueLine("size", formatBytes(typeof value.sizeBytes === "number" ? value.sizeBytes : null)),
     valueLine("owner", value.owner),
     valueLine("createdAt", value.createdAt),
-  ]);
+  ];
+  if (options.includeBlobId) {
+    pushOptionalLine(lines, "blobId", value.blobId);
+  }
+  writeLines(lines);
 }
 
 function printStreamUrlResult(fileId: string, streamUrl: string, options: CliOptions) {
@@ -536,6 +692,7 @@ function printHealthResult(value: Record<string, unknown>, options: CliOptions) 
 function printConfigResult(
   value: {
     baseUrl: string;
+    path: string;
     auth: Record<string, unknown>;
     upload: Record<string, unknown>;
   },
@@ -548,6 +705,7 @@ function printConfigResult(
 
   writeLines([
     headline("CLI Configuration"),
+    valueLine("path", value.path),
     valueLine("baseUrl", value.baseUrl),
     section("Auth"),
     valueLine("apiKey", value.auth.apiKey),
@@ -567,6 +725,38 @@ function printConfigResult(
     valueLine("json", options.json),
     valueLine("verbose", options.verbose),
   ]);
+}
+
+async function runConfigPath(options: CliOptions) {
+  const configPath = getConfigPath();
+  if (options.json) {
+    printResult({ path: configPath }, true);
+    return;
+  }
+  writeLines([headline("CLI Config Path"), valueLine("path", configPath)]);
+}
+
+async function runConfigSet(keyRaw: string | undefined, valueRaw: string | undefined, options: CliOptions) {
+  const key = requireConfigKey(keyRaw);
+  const value = requireValue(valueRaw, "config value");
+  const config = await readStoredConfig();
+  config[CONFIG_KEY_MAP[key]] = value;
+  await writeStoredConfig(config);
+  if (!options.json) infoLine(`saved ${key} in ${getConfigPath()}`);
+  printSimpleActionResult(
+    "Config Updated",
+    { key, value: key.includes("key") || key === "bearer" ? "[configured]" : value, path: getConfigPath() },
+    options
+  );
+}
+
+async function runConfigUnset(keyRaw: string | undefined, options: CliOptions) {
+  const key = requireConfigKey(keyRaw);
+  const config = await readStoredConfig();
+  delete config[CONFIG_KEY_MAP[key]];
+  await writeStoredConfig(config);
+  if (!options.json) infoLine(`removed ${key} from ${getConfigPath()}`);
+  printSimpleActionResult("Config Updated", { key, removed: true, path: getConfigPath() }, options);
 }
 
 async function readFileAsBlob(filePath: string, contentType: string): Promise<Blob> {
@@ -759,6 +949,7 @@ async function runOpsHealth(options: CliOptions) {
 async function runConfigShow(options: CliOptions) {
   printConfigResult(
     {
+      path: getConfigPath(),
       baseUrl: options.baseUrl,
       auth: {
         apiKey: options.apiKey ? "[configured]" : null,
@@ -782,7 +973,7 @@ async function runConfigShow(options: CliOptions) {
 }
 
 async function main() {
-  const { command, options } = parseArgs(process.argv.slice(2));
+  const { command, options } = await parseArgs(process.argv.slice(2));
 
   switch (command.kind) {
     case "help":
@@ -817,6 +1008,15 @@ async function main() {
       return;
     case "config.show":
       await runConfigShow(options);
+      return;
+    case "config.path":
+      await runConfigPath(options);
+      return;
+    case "config.set":
+      await runConfigSet(command.key, command.value, options);
+      return;
+    case "config.unset":
+      await runConfigUnset(command.key, options);
       return;
   }
 }
